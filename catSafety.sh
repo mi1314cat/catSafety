@@ -55,6 +55,35 @@ else
     R=""; B=""; RED=""; GRN=""; YEL=""; BLU=""; MAG=""; DIM=""; CYN=""
 fi
 
+# ---------------------------- 视觉（渐变 / 加载条 / 猫咪横幅） ----------------------------
+cs_gradient() { # <文本>
+    local text="$1" i out="" colors=(45 51 87 123 159)
+    for ((i=0; i<${#text}; i++)); do
+        out+="\033[38;5;${colors[i % ${#colors[@]}]}m${text:i:1}"
+    done
+    printf '%b\033[0m' "$out"
+}
+
+cs_loading() {
+    [[ -t 1 ]] || return 0
+    local bar="" i
+    for i in $(seq 1 20); do
+        bar+="█"
+        printf '\r%b 加载中 [%-20s]%b' "$GRN" "$bar" "$R"
+        sleep 0.015
+    done
+    printf '\r\033[K'
+}
+
+cs_banner() {
+    printf '\n'
+    printf '%b        |\\__/,|   (\\\n' "$GRN"
+    printf '%b      _.|o o  |_   ) )%b\n' "$GRN" "$R"
+    printf '%b  ---(((---(((-------------------%b\n' "$GRN" "$R"
+    printf '      %b   %bv%s%b\n' "$(cs_gradient 'catSafety · 防火墙 / 安全工具')" "$DIM" "$CS_VERSION" "$R"
+    printf '\n'
+}
+
 # ---------------------------- 排版工具（中文/emoji 宽度对齐） ----------------------------
 export LC_ALL="${LC_ALL:-C.UTF-8}" 2>/dev/null || true
 
@@ -1819,9 +1848,8 @@ cs_menu_header() {
         f2b_txt="${YEL}未运行${R}"
     fi
 
-    cs_box_top "catSafety · 防火墙 / 安全工具"
-    cs_box_row "$(printf '%b%s%b  v%s' "$B" "版本" "$R" "$CS_VERSION")"
-    cs_box_sep
+    cs_banner
+    cs_box_top "运行状态"
     cs_box_kv "SSH 守护" "$guard_txt"
     cs_box_kv "防火墙" "$fw_txt"
     cs_box_kv "自动开放" "$auto_txt"
@@ -2125,7 +2153,7 @@ EOF
 cs_cli() {
     local cmd="${1:-menu}"
     case "$cmd" in
-        menu) main_menu ;;
+        menu) cs_loading; main_menu ;;
         status) cs_status ;;
         takeover) shift; cs_takeover "$@" ;;
         sync) shift; cs_kernel_sync "$@" ;;

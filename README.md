@@ -90,6 +90,13 @@ catSafety switch nft     # 或 ufw；账本/端口自动迁移
   - `/etc/catSafety/hooks/pre-switch <old> <new>`
   - `/etc/catSafety/hooks/post-switch <old> <new>`
 
+## 界面
+
+- 启动有绿色加载条；顶部是猫咪横幅 + 渐变色标题（对齐 Catmiup 面板风格）；
+- 「运行状态」卡片：SSH 守护 / 防火墙 / 自动开放 / Fail2ban，状态用绿/黄/红显示；
+- 「功能菜单」卡片：编号、名称、说明三列按中文宽度对齐；
+- 所有子菜单统一「状态 + 操作」两段，危险项标红。
+
 ## 快速开始
 
 ```bash
