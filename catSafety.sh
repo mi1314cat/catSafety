@@ -55,6 +55,89 @@ else
     R=""; B=""; RED=""; GRN=""; YEL=""; BLU=""; MAG=""; DIM=""; CYN=""
 fi
 
+# ---------------------------- 排版工具（中文/emoji 宽度对齐） ----------------------------
+export LC_ALL="${LC_ALL:-C.UTF-8}" 2>/dev/null || true
+
+cs_w() { # 显示宽度（去掉 ANSI，中文/全角按 2）
+    python3 -c '
+import re, sys, unicodedata
+s = re.sub(r"\x1b\[[0-9;]*m", "", sys.argv[1])
+w = 0
+for ch in s:
+    if unicodedata.combining(ch):
+        continue
+    w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+print(w)
+' "$1"
+}
+
+cs_trunc() { # <字符串> <最大宽度>
+    python3 - "$1" "${2:-60}" <<'PY'
+import re, sys, unicodedata
+s = re.sub(r"\x1b\[[0-9;]*m", "", sys.argv[1])
+maxw = int(sys.argv[2])
+w = 0; out = []
+for ch in s:
+    if unicodedata.combining(ch):
+        out.append(ch); continue
+    cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    if w + cw > maxw - 1:          # 给省略号留 1 列
+        out.append("…"); break
+    w += cw; out.append(ch)
+print("".join(out), end="")
+PY
+}
+
+cs_pad() { # <字符串> <目标宽度>
+    local s="$1" target="${2:-0}" w n
+    w=$(cs_w "$s"); n=$((target - w)); (( n < 0 )) && n=0
+    printf '%s%*s' "$s" "$n" ''
+}
+
+CS_W="${CS_W:-0}"
+if (( CS_W <= 0 )); then
+    _cols=$(tput cols 2>/dev/null || echo 80)
+    [[ "$_cols" =~ ^[0-9]+$ ]] || _cols=80
+    CS_W=$((_cols - 2))
+    (( CS_W > 64 )) && CS_W=64
+    (( CS_W < 46 )) && CS_W=46
+fi
+
+cs_box_top() { # <标题>
+    local title="${1:-}" tw rest l r
+    tw=$(cs_w "$title"); rest=$(( CS_W - tw - 2 )); (( rest < 0 )) && rest=0
+    printf -v l '%*s' $((rest/2)) '';  l=${l// /─}
+    printf -v r '%*s' $((rest - rest/2)) ''; r=${r// /─}
+    printf '%b╭%s %s %s╮%b\n' "$CYN" "$l" "$title" "$r" "$R"
+}
+cs_box_sep() {
+    local d; printf -v d '%*s' "$CS_W" ''; d=${d// /─}
+    printf '%b├%s┤%b\n' "$CYN" "$d" "$R"
+}
+cs_box_bot() {
+    local d; printf -v d '%*s' "$CS_W" ''; d=${d// /─}
+    printf '%b╰%s╯%b\n' "$CYN" "$d" "$R"
+}
+cs_box_row() { # <可见内容>
+    local s=" $(cs_trunc "${1:-}" $((CS_W-1)))" n
+    n=$(( CS_W - $(cs_w "$s") )); (( n < 0 )) && n=0
+    printf '%b│%b%s%*s%b│%b\n' "$CYN" "$R" "$s" "$n" '' "$CYN" "$R"
+}
+cs_box_kv() { # <标签> <值> [颜色]
+    local label="$1" value="$2" color="${3:-}" l
+    l=$(cs_pad "$label" 12)
+    cs_box_row "$(printf '%b%s%b  %s' "${B}${color}" "$l" "$R" "$value")"
+}
+cs_box_menu() { # <编号> <名称> <说明> [颜色]
+    local num="$1" name="$2" desc="$3" color="${4:-$GRN}" left
+    left=$(cs_pad "$num  $name" 16)
+    cs_box_row "$(printf '%b%s%b %s' "$color" "$left" "$R" "$desc")"
+}
+cs_rule() {
+    local d; printf -v d '%*s' "$CS_W" ''; d=${d// /─}
+    printf '%b%s%b\n' "$CYN" "$d" "$R"
+}
+
 # ---------------------------- 基础工具 ----------------------------
 cs_root_check() {
     [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo -e "${RED}需要 root 运行${R}" >&2; exit 1; }
@@ -69,7 +152,7 @@ err()  { printf '  %b[ERR]%b %s\n' "$RED" "$R" "$*" >&2; }
 info() { printf '  %b[--]%b %s\n' "$DIM" "$R" "$*"; }
 die()  { err "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
-hr()   { printf '%s\n' "──────────────────────────────────────────────────────────────"; }
+hr()   { cs_rule 2>/dev/null || printf '%s\n' "──────────────────────────────────────────────────────────────"; }
 pause_() {
     printf '\n  按回车继续...'; read -r _ || true
 }
@@ -567,29 +650,28 @@ cs_ssh_verify() { # 0=所有 SSH 端口都有规则
 
 cs_ssh_status() {
     local p
-    hr
-    printf '  %bSSH 端口%b: %s\n' "$B" "$R" "$(cs_ssh_ports | paste -sd' ' -)"
-    printf '  %b监听状态%b: %s\n' "$B" "$R" "$(cs_ssh_listening && echo 运行中 || echo 未监听)"
-    printf '  %b当前后端%b: %s\n' "$B" "$R" "$(cs_backend_get)"
-    printf '  %b规则检查%b:\n' "$B" "$R"
+    cs_box_top "SSH 保护"
+    cs_box_kv "SSH 端口" "$(cs_ssh_ports | paste -sd' ' -)"
+    cs_box_kv "监听" "$(cs_ssh_listening && echo "${GRN}运行中${R}" || echo "${RED}未监听${R}")"
+    cs_box_kv "后端" "$(cs_backend_get)"
+    cs_box_sep
     while read -r p; do
         [[ -n "$p" ]] || continue
         if cs_rule_exists tcp "$p"; then
-            printf '    %s/tcp  %b已放行%b\n' "$p" "$GRN" "$R"
+            cs_box_row "$(printf '  %-8s %b已放行%b' "${p}/tcp" "$GRN" "$R")"
         else
-            printf '    %s/tcp  %b未放行%b  ← 危险\n' "$p" "$RED" "$R"
+            cs_box_row "$(printf '  %-8s %b未放行 ← 危险%b' "${p}/tcp" "$RED" "$R")"
         fi
     done < <(cs_ssh_ports)
-    # 第三方 DROP 规则检查
+    # 第三方 DROP
     if have iptables; then
         while read -r p; do
-            [[ -n "$p" ]] || continue
-            if iptables -S INPUT 2>/dev/null | grep -E -- "--dport ${p} .* -j (DROP|REJECT)"; then
-                printf '    %b发现针对 %s 的 DROP/REJECT 规则（第三方）%b\n' "$YEL" "$p" "$R"
+            if iptables -S INPUT 2>/dev/null | grep -E -- "--dport ${p} .* -j (DROP|REJECT)" >/dev/null; then
+                cs_box_row "$(printf '  %b发现第三方 DROP/REJECT 针对 %s%b' "$YEL" "$p" "$R")"
             fi
         done < <(cs_ssh_ports)
     fi
-    hr
+    cs_box_bot
 }
 
 # ---------------------------- 启用 / 停用 ----------------------------
@@ -1532,22 +1614,25 @@ cs_f2b_install() {
 }
 
 cs_f2b_status() {
-    if ! have fail2ban-client; then info "fail2ban 未安装"; return 0; fi
-    hr
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
-        printf '  %bFail2ban%b: %b运行中%b\n' "$B" "$R" "$GRN" "$R"
-    else
-        printf '  %bFail2ban%b: %b未运行%b\n' "$B" "$R" "$RED" "$R"
+    if ! have fail2ban-client; then
+        cs_box_top "Fail2ban"
+        cs_box_row "  未安装（菜单 1 可安装）"
+        cs_box_bot
+        return 0
     fi
-    printf '  banaction: %s\n' "$(grep -hE '^banaction' /etc/fail2ban/jail.d/*.local /etc/fail2ban/jail.local 2>/dev/null | tail -1 | sed 's/.*= *//')"
-    printf '  白名单  : %s\n' "$(grep -hE '^ignoreip' /etc/fail2ban/jail.d/*.local /etc/fail2ban/jail.local 2>/dev/null | tail -1 | sed 's/.*= *//')"
     local j
+    cs_box_top "Fail2ban"
+    cs_box_kv "服务" "$(systemctl is-active --quiet fail2ban 2>/dev/null && echo "${GRN}运行中${R}" || echo "${RED}未运行${R}")"
+    cs_box_kv "banaction" "$(grep -hE '^banaction' /etc/fail2ban/jail.d/*.local /etc/fail2ban/jail.local 2>/dev/null | tail -1 | sed 's/.*= *//')"
+    cs_box_kv "白名单" "$(grep -hE '^ignoreip' /etc/fail2ban/jail.d/*.local /etc/fail2ban/jail.local 2>/dev/null | tail -1 | sed 's/.*= *//')"
+    cs_box_sep
     for j in $(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do
-        printf '  %b%s%b: %s\n' "$B" "$j" "$R" \
-            "$(fail2ban-client status "$j" 2>/dev/null | sed -n 's/.*Currently banned:[[:space:]]*//p') 个封禁"
-        fail2ban-client status "$j" 2>/dev/null | grep -E 'Banned IP list' | sed 's/^/    /'
+        cs_box_row "$(printf '  %-12s %s 个封禁' "$j" "$(fail2ban-client status "$j" 2>/dev/null | sed -n 's/.*Currently banned:[[:space:]]*//p')")"
+        fail2ban-client status "$j" 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*/      /p' | sed 's/^/ /' | while IFS= read -r l; do
+            cs_box_row "${DIM}${l}${R}"
+        done
     done
-    hr
+    cs_box_bot
 }
 
 # 检查"当前登录 IP 是否被自己的 fail2ban 封了"—— 这是 SSH 失联的常见原因之一
@@ -1588,20 +1673,23 @@ cs_f2b_whitelist() { # <ip>
 
 # ---------------------------- 列表 / 对账 ----------------------------
 cs_ports_list() {
-    hr
-    printf '  %-10s %-5s %-7s %-28s %s\n' "OWNER" "PROTO" "PORT" "标签" "状态"
+    cs_box_top "端口账本"
+    cs_box_row "$(printf '%b%s%b' "$DIM" "$(cs_pad "OWNER" 10) $(cs_pad "PROTO" 6) $(cs_pad "PORT" 6) $(cs_pad "状态" 16) 标签" "$R")"
+    cs_box_sep
     if [[ -s "$CS_LEDGER" ]]; then
+        local owner proto port tag ts st line
         while IFS=$'\t' read -r owner proto port tag ts; do
             [[ -n "$port" ]] || continue
-            local st=""
-            cs_rule_exists tcp "$port" && st+="规则✓ " || st+="规则✗ "
-            ss -Hltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$" && st+="监听✓" || st+="监听✗"
-            printf '  %-10s %-5s %-7s %-28s %s\n' "$owner" "$proto" "$port" "${tag:0:26}" "$st"
+            st=""
+            cs_rule_exists tcp "$port" && st+="${GRN}规则✓${R} " || st+="${RED}规则✗${R} "
+            cs_listen_has tcp "$port" || cs_listen_has udp "$port" && st+="${GRN}监听✓${R}" || st+="${DIM}监听✗${R}"
+            line="$(cs_pad "$owner" 10) $(cs_pad "$proto" 6) $(cs_pad "$port" 6) "
+            cs_box_row "${line}${st}  ${DIM}${tag}${R}"
         done <"$CS_LEDGER"
     else
-        echo "  （账本为空）"
+        cs_box_row "${DIM}（账本为空）${R}"
     fi
-    hr
+    cs_box_bot
 }
 
 cs_drift_check() {
@@ -1654,7 +1742,7 @@ cs_scan_age()  { cs_age_str "$(cat "$CS_LAST_SCAN_FILE" 2>/dev/null || echo 0)";
 cs_f2b_summary() {
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
         local j; j=$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ')
-        printf '运行中%s' "${j:+ · $j}"
+        printf '运行中%s' "${j:+ · ${j//,/ · }}"
     else
         printf '未运行'
     fi
@@ -1670,23 +1758,25 @@ cs_unit_state() { # <unit> → active/inactive/未安装（单行）
 }
 
 cs_status() {
-    local be enabled active
-    be=$(cs_backend_get); enabled=$(cs_enabled_get)
-    hr
-    printf '  %bcatSafety%b v%s\n' "$B" "$R" "$CS_VERSION"
-    printf '  后端        : %s\n' "$be"
-    printf '  启用状态    : %s\n' "$([[ "$enabled" == "1" ]] && echo 已启用 || echo 未启用)"
-    printf '  实际生效    : %s\n' "$(cs_backend_active && echo 是 || echo 否)"
-    printf '  SSH 端口    : %s\n' "$(cs_ssh_ports | paste -sd' ' -)"
-    printf '  SSH 监听    : %s\n' "$(cs_ssh_listening && echo 是 || echo 否)"
-    printf '  SSH 规则    : %s\n' "$(cs_ssh_verify && echo 完整 || echo "缺失:$(cs_ssh_rule_missing)")"
-    printf '  guard 定时器: %s\n' "$(cs_unit_state catSafety-guard.timer)"
-    printf '  fail2ban    : %s\n' "$(cs_unit_state fail2ban)"
-    printf '  外部防火墙  : %s\n' "$(cs_foreign_list)"
-    printf '  账本条目    : %s\n' "$([[ -f "$CS_LEDGER" ]] && wc -l <"$CS_LEDGER" || echo 0)"
-    printf '  内核端口    : X=%s M=%s SB=%s\n' \
-        "$(cs_kernel_ports xray | wc -w)" "$(cs_kernel_ports mihomo | wc -w)" "$(cs_kernel_ports sing-box | wc -w)"
-    hr
+    local be enabled active ssh guard f2b
+    be=$(cs_backend_get); enabled=$(cs_enabled_get); active=$(cs_backend_active && echo 是 || echo 否)
+    ssh=$(cs_ssh_ports | paste -sd, -)
+    guard=$(systemctl is-active catSafety-guard.timer 2>/dev/null || echo 未安装)
+    f2b=$(cs_f2b_summary)
+    cs_box_top "catSafety 状态"
+    cs_box_kv "版本" "v${CS_VERSION}"
+    cs_box_kv "后端" "${B}${be}${R}"
+    cs_box_kv "启用" "$([[ "$enabled" == "1" ]] && echo "${GRN}是${R}" || echo "${YEL}否${R}")  · 实际生效: ${active}"
+    cs_box_sep
+    cs_box_kv "SSH 端口" "${B}${ssh}${R}  · 规则: $(cs_ssh_verify && echo "${GRN}完整${R}" || echo "${RED}缺失:$(cs_ssh_rule_missing)${R}")"
+    cs_box_kv "SSH 守护" "$([[ "$guard" == "active" ]] && echo "${GRN}运行中${R} · $(cs_guard_age)检查" || echo "${YEL}${guard}${R}")"
+    cs_box_kv "自动开放" "扫描 $([[ "$(cs_autoscan_on)" == "0" ]] && echo 关 || echo 开) · 回收 $(cs_autoclose_on && echo 开 || echo 关) · 最近 $(cs_scan_age)"
+    cs_box_kv "Fail2ban" "${f2b}"
+    cs_box_sep
+    cs_box_kv "账本" "$([[ -f "$CS_LEDGER" ]] && wc -l <"$CS_LEDGER" || echo 0) 条 · owner 清单 $([[ -d "$CS_OWNERS_DIR" ]] && ls -1 "$CS_OWNERS_DIR"/*.ports 2>/dev/null | wc -l || echo 0) 个"
+    cs_box_kv "内核端口" "X=$(cs_kernel_ports xray | wc -w) · M=$(cs_kernel_ports mihomo | wc -w) · SB=$(cs_kernel_ports sing-box | wc -w)"
+    cs_box_kv "外部防火墙" "$(cs_foreign_list)"
+    cs_box_bot
 }
 
 cs_selfcheck() {
@@ -1707,46 +1797,58 @@ cs_selfcheck() {
 # ---------------------------- 菜单 ----------------------------
 cs_menu_header() {
     clear 2>/dev/null || true
-    printf '%b\n' "$CYN"
-    cat <<'EOF'
-      /\_/\
-     ( o.o )   catSafety
-      > ^ <    防火墙 / 安全工具
-EOF
-    printf '%b' "$R"
-    local be guard_state ssh_ports f2b auto_state
+    local be en ssh_ports guard_txt fw_txt auto_txt f2b_txt
     be=$(cs_backend_get)
+    en=$(cs_enabled_get)
     ssh_ports=$(cs_ssh_ports | paste -sd, -)
+
     if systemctl is-active --quiet catSafety-guard.timer 2>/dev/null; then
-        guard_state="${GRN}● 守护中${R}（${DIM}$(cs_guard_age)检查${R}）"
+        guard_txt="${GRN}运行中${R} · 端口 ${B}${ssh_ports}${R} · $(cs_guard_age)检查"
     else
-        guard_state="${YEL}○ 未运行${R}"
+        guard_txt="${YEL}未运行${R} · 端口 ${B}${ssh_ports}${R}"
     fi
-    if [[ "$(cs_enabled_get)" == "1" ]]; then
-        fw_state="${GRN}已启用${R}"
+    if [[ "$en" == "1" ]]; then
+        fw_txt="${GRN}已启用${R} · 后端 ${B}${be}${R} · 账本 $([[ -f "$CS_LEDGER" ]] && wc -l <"$CS_LEDGER" || echo 0) 条"
     else
-        fw_state="${YEL}未启用${R}"
+        fw_txt="${YEL}未启用${R} · 后端 ${B}${be}${R}"
     fi
-    auto_state=$([[ "$(cs_autoscan_on)" == "0" ]] && echo "${YEL}关${R}" || echo "${GRN}开${R}")
-    printf '  ┌────────────────────────────────────────────────────────┐\n'
-    printf '  │ 🛡  SSH 守护   %b  端口 %b%s%b\n' "$guard_state" "$B" "$ssh_ports" "$R"
-    printf '  │ 🔥  防火墙     %b %b· 账本 %s 条%b\n' "$B$be$R" "$fw_state" "$([[ -f "$CS_LEDGER" ]] && wc -l <"$CS_LEDGER" || echo 0)" "$R"
-    printf '  │ 👀  自动开放   %b  %b· 最近扫描 %s%b\n' "$auto_state" "$DIM" "$(cs_scan_age)" "$R"
-    printf '  │ 🚫  Fail2ban   %b%s%b\n' "$B" "$(cs_f2b_summary)" "$R"
-    printf '  └────────────────────────────────────────────────────────┘\n'
+    auto_txt="扫描 $([[ "$(cs_autoscan_on)" == "0" ]] && echo "${YEL}关${R}" || echo "${GRN}开${R}") · 回收 $(cs_autoclose_on && echo "${GRN}开${R}" || echo "${YEL}关${R}") · 最近 $(cs_scan_age)"
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        f2b_txt="${GRN}运行中${R} · $(cs_f2b_summary | sed 's/^运行中 · //')"
+    else
+        f2b_txt="${YEL}未运行${R}"
+    fi
+
+    cs_box_top "catSafety · 防火墙 / 安全工具"
+    cs_box_row "$(printf '%b%s%b  v%s    %b%s%b' "$B" "版本" "$R" "$CS_VERSION" "$DIM" "为 Xray / Mihomo / Sing-box 设计" "$R")"
+    cs_box_sep
+    cs_box_kv "SSH 守护" "$guard_txt"
+    cs_box_kv "防火墙" "$fw_txt"
+    cs_box_kv "自动开放" "$auto_txt"
+    cs_box_kv "Fail2ban" "$f2b_txt"
+    cs_box_bot
 }
+
 
 
 cs_menu_ufw() {
     while true; do
         cs_menu_header
-        hr
-        printf '  %bUFW%b  安装:%s  运行:%s\n' "$B" "$R" \
-            "$(have ufw && echo 是 || echo 否)" \
-            "$(have ufw && (ufw status 2>/dev/null | head -1) || echo -)"
-        hr
-        printf '  1) 安装 UFW\n  2) 启用 UFW（安全模式，带回滚）\n  3) 停用 UFW\n  4) 查看状态\n  5) 设为本工具后端\n  0) 返回\n'
-        printf '  请选择 [0-5]: '; read -r c || return 0
+        cs_box_top "UFW"
+        cs_box_kv "安装" "$(have ufw && echo 是 || echo 否)"
+        cs_box_kv "状态" "$(have ufw && (ufw status 2>/dev/null | head -1) || echo 未安装)"
+        cs_box_kv "当前后端" "$(cs_backend_get)"
+        cs_box_sep
+        cs_box_menu "1" "安装 UFW" "apt install ufw"
+        cs_box_menu "2" "启用 UFW" "安全模式，带 180s 回滚"
+        cs_box_menu "3" "停用 UFW" "保留规则"
+        cs_box_menu "4" "查看状态" "ufw status verbose"
+        cs_box_menu "5" "设为后端" "catSafety 后续按 ufw 管"
+        cs_box_sep
+        cs_box_menu "0" "返回" "" "$RED"
+        cs_box_bot
+        printf '  %b请选择 [0-5]: %b' "$GRN" "$R"
+        read -r c || return 0
         case "$c" in
             1) cs_pkg_install ufw && ok "UFW 已安装" || err "安装失败"; pause_ ;;
             2) cs_backend_set ufw; cs_enable; pause_ ;;
@@ -1762,13 +1864,21 @@ cs_menu_ufw() {
 cs_menu_nft() {
     while true; do
         cs_menu_header
-        hr
-        printf '  %bnftables%b  安装:%s  本工具表:%s\n' "$B" "$R" \
-            "$(have nft && echo 是 || echo 否)" \
-            "$(nft list table inet "$CS_NFT_TABLE" >/dev/null 2>&1 && echo 存在 || echo 无)"
-        hr
-        printf '  1) 安装 nftables\n  2) 启用 nftables（自有表 + 默认拒绝）\n  3) 停用（删除自有表）\n  4) 查看规则\n  5) 设为本工具后端\n  0) 返回\n'
-        printf '  请选择 [0-5]: '; read -r c || return 0
+        cs_box_top "nftables"
+        cs_box_kv "安装" "$(have nft && echo 是 || echo 否)"
+        cs_box_kv "自有表" "$(nft list table inet "$CS_NFT_TABLE" >/dev/null 2>&1 && echo 存在 || echo 无)"
+        cs_box_kv "当前后端" "$(cs_backend_get)"
+        cs_box_sep
+        cs_box_menu "1" "安装 nftables" "apt install nftables"
+        cs_box_menu "2" "启用 nftables" "自有表 + 默认拒绝"
+        cs_box_menu "3" "停用" "删除自有表"
+        cs_box_menu "4" "查看规则" "nft list table"
+        cs_box_menu "5" "设为后端" "catSafety 后续按 nft 管"
+        cs_box_sep
+        cs_box_menu "0" "返回" "" "$RED"
+        cs_box_bot
+        printf '  %b请选择 [0-5]: %b' "$GRN" "$R"
+        read -r c || return 0
         case "$c" in
             1) cs_pkg_install nftables && ok "nftables 已安装" || err "安装失败"; pause_ ;;
             2) cs_backend_set nft; cs_enable; pause_ ;;
@@ -1785,8 +1895,18 @@ cs_menu_f2b() {
     while true; do
         cs_menu_header
         cs_f2b_status
-        printf '  1) 安装 / 重配 Fail2ban\n  2) 解封全部\n  3) 解封单个 IP\n  4) 加白名单\n  5) 重启\n  6) 检查当前 IP 是否被封\n  0) 返回\n'
-        printf '  请选择 [0-6]: '; read -r c || return 0
+        cs_box_top "Fail2ban 操作"
+        cs_box_menu "1" "安装 / 重配" "写 zzz-catSafety.local，失败自动回滚"
+        cs_box_menu "2" "解封全部" "清空所有 jail 的封禁"
+        cs_box_menu "3" "解封单个 IP" ""
+        cs_box_menu "4" "加白名单" "ignoreip，重启生效"
+        cs_box_menu "5" "重启服务" ""
+        cs_box_menu "6" "检查当前 IP" "被自己的 jail 封了就解封"
+        cs_box_sep
+        cs_box_menu "0" "返回" "" "$RED"
+        cs_box_bot
+        printf '  %b请选择 [0-6]: %b' "$GRN" "$R"
+        read -r c || return 0
         case "$c" in
             1) cs_f2b_install; pause_ ;;
             2) cs_f2b_unban all; pause_ ;;
@@ -1804,8 +1924,16 @@ cs_menu_ssh() {
     while true; do
         cs_menu_header
         cs_ssh_status
-        printf '  1) 立即补齐 SSH 放行\n  2) 安装/启动守护（每分钟自检）\n  3) 停止守护\n  4) PANIC 紧急放行\n  0) 返回\n'
-        printf '  请选择 [0-4]: '; read -r c || return 0
+        cs_box_top "SSH 保护操作"
+        cs_box_menu "1" "立即补齐 SSH 放行" "把缺的规则补上"
+        cs_box_menu "2" "安装/启动守护" "每分钟自检并抢救"
+        cs_box_menu "3" "停止守护" "不推荐，除非你在调试"
+        cs_box_menu "4" "PANIC 紧急放行" "停用防火墙保证能进" "$RED"
+        cs_box_sep
+        cs_box_menu "0" "返回" "" "$RED"
+        cs_box_bot
+        printf '  %b请选择 [0-4]: %b' "$GRN" "$R"
+        read -r c || return 0
         case "$c" in
             1) cs_ssh_protect; pause_ ;;
             2) cs_install_guard; pause_ ;;
@@ -1821,8 +1949,17 @@ cs_menu_ports() {
     while true; do
         cs_menu_header
         cs_ports_list
-        printf '  1) 放行端口\n  2) 关闭端口\n  3) 三内核同步\n  4) 漂移检查\n  5) 自动对账（按监听开关）\n  0) 返回\n'
-        printf '  请选择 [0-5]: '; read -r c || return 0
+        cs_box_top "端口操作"
+        cs_box_menu "1" "放行端口" "立即写入账本与后端"
+        cs_box_menu "2" "关闭端口" "只关账本里归属明确的"
+        cs_box_menu "3" "三内核同步" "按配置扫描并放行"
+        cs_box_menu "4" "漂移检查" "账本/规则/监听三方对账"
+        cs_box_menu "5" "自动对账" "按监听状态开关"
+        cs_box_sep
+        cs_box_menu "0" "返回" "" "$RED"
+        cs_box_bot
+        printf '  %b请选择 [0-5]: %b' "$GRN" "$R"
+        read -r c || return 0
         case "$c" in
             1)
                 printf '  owner (xray/mihomo/sing-box/share/自定义): '; read -r o
@@ -1848,21 +1985,24 @@ cs_menu_ports() {
 cs_menu_auto() {
     while true; do
         cs_menu_header
-        hr
-        printf '  %b自动开放%b  扫描: %s   回收: %s   宽限: %s 秒\n' "$B" "$R" \
-            "$([[ "$(cs_autoscan_on)" == "0" ]] && echo 关 || echo 开)" \
-            "$(cs_autoclose_on && echo 开 || echo 关)" "$CS_AUTO_GRACE"
-        printf '    最近扫描: %s\n' "$(cs_scan_age)"
-        hr
-        printf '  1) 开/关 自动扫描（是否自动放行新监听端口）\n'
-        printf '  2) 开/关 自动回收（监听消失后是否自动关闭）\n'
-        printf '  3) 立即对账\n'
-        printf '  0) 返回\n'
-        printf '  请选择 [0-3]: '; read -r c || return 0
+        cs_box_top "自动开放"
+        cs_box_kv "自动扫描" "$([[ "$(cs_autoscan_on)" == "0" ]] && echo 关 || echo "${GRN}开${R}")"
+        cs_box_kv "自动回收" "$(cs_autoclose_on && echo "${GRN}开${R}" || echo 关)"
+        cs_box_kv "宽限期" "${CS_AUTO_GRACE} 秒"
+        cs_box_kv "最近扫描" "$(cs_scan_age)"
+        cs_box_sep
+        cs_box_menu "1" "开/关 自动扫描" "是否自动放行新监听端口"
+        cs_box_menu "2" "开/关 自动回收" "监听消失后是否自动关闭"
+        cs_box_menu "3" "立即对账" "马上执行一次"
+        cs_box_sep
+        cs_box_menu "0" "返回" "" "$RED"
+        cs_box_bot
+        printf '  %b请选择 [0-3]: %b' "$GRN" "$R"
+        read -r c || return 0
         case "$c" in
             1) [[ "$(cs_autoscan_on)" == "0" ]] && { cs_autoscan_set 1; ok "自动扫描已开"; } || { cs_autoscan_set 0; warn "自动扫描已关"; }; pause_ ;;
             2) cs_autoclose_on && { cs_autoclose_set 0; warn "自动回收已关（只开不关）"; } || { cs_autoclose_set 1; ok "自动回收已开"; }; pause_ ;;
-            3) catSafety autosync 2>/dev/null || cs_autosync; pause_ ;;
+            3) cs_autosync; pause_ ;;
             0) return 0 ;;
             *) err "无效选项"; pause_ ;;
         esac
@@ -1873,9 +2013,18 @@ cs_menu_backup() {
     while true; do
         cs_menu_header
         local last; last=$(ls -1 "$CS_BACKUP" 2>/dev/null | tail -1)
-        printf '  备份目录: %s\n  最近备份: %s\n' "$CS_BACKUP" "${last:-无}"
-        printf '  1) 立即备份\n  2) 从备份恢复\n  3) 查看备份列表\n  0) 返回\n'
-        printf '  请选择 [0-3]: '; read -r c || return 0
+        cs_box_top "备份 / 恢复"
+        cs_box_kv "备份目录" "$CS_BACKUP"
+        cs_box_kv "最近备份" "${last:-无}"
+        cs_box_sep
+        cs_box_menu "1" "立即备份" "iptables/nft/ufw/crontab//etc"
+        cs_box_menu "2" "从备份恢复" "输入目录名"
+        cs_box_menu "3" "查看备份列表" ""
+        cs_box_sep
+        cs_box_menu "0" "返回" "" "$RED"
+        cs_box_bot
+        printf '  %b请选择 [0-3]: %b' "$GRN" "$R"
+        read -r c || return 0
         case "$c" in
             1) d=$(cs_backup) && ok "已备份到 $d"; pause_ ;;
             2) printf '  备份目录名: '; read -r d; cs_restore "$CS_BACKUP/$d"; pause_ ;;
@@ -1907,19 +2056,21 @@ cs_restore() { # <dir>
 main_menu() {
     while true; do
         cs_menu_header
-        printf '  ┌──────────────────── 功能 ─────────────────────┐\n'
-        printf '  │ %b1%b) UFW        安装 / 启用 / 停用 / 状态   │\n' "$B" "$R"
-        printf '  │ %b2%b) nftables   安装 / 启用 / 停用 / 规则   │\n' "$B" "$R"
-        printf '  │ %b3%b) Fail2ban   安装 / 状态 / 解封 / 白名单 │\n' "$B" "$R"
-        printf '  │ %b4%b) 一键接管   导入规则 + 三内核 + 停第三方│\n' "$B" "$R"
-        printf '  │ %b5%b) SSH 保护   状态 / 自动抢救 / PANIC    │\n' "$B" "$R"
-        printf '  │ %b6%b) 端口管理   列表 / 放行 / 关闭 / 对账  │\n' "$B" "$R"
-        printf '  │ %b7%b) 三内核同步 立即扫描并放行当前端口      │\n' "$B" "$R"
-        printf '  │ %b8%b) 自动开放   监听端口自动开关 [%b%s%b]     │\n' "$B" "$R" "$([[ "$(cs_autoscan_on)" == "0" ]] && echo "$RED关$R" || echo "$GRN开$R")" "$R"
-        printf '  │ %b9%b) 备份/恢复 / 自检                       │\n' "$B" "$R"
-        printf '  │ %b0%b) 返回                                   │\n' "$B" "$R"
-        printf '  └───────────────────────────────────────────────┘\n'
-        printf '  请选择 [0-9]: '
+        cs_box_top "功能菜单"
+        cs_box_menu "1" "UFW"        "安装 / 启用 / 停用 / 状态"
+        cs_box_menu "2" "nftables"   "安装 / 启用 / 停用 / 规则"
+        cs_box_menu "3" "Fail2ban"   "安装 / 状态 / 解封 / 白名单"
+        cs_box_menu "4" "一键接管"   "导入规则 + 三内核 + 停第三方" "$MAG"
+        cs_box_menu "5" "SSH 保护"   "状态 / 自动抢救 / PANIC" "$MAG"
+        cs_box_menu "6" "端口管理"   "列表 / 放行 / 关闭 / 对账"
+        cs_box_menu "7" "三内核同步" "立即扫描并放行当前端口"
+        cs_box_menu "8" "自动开放"   "扫描 [$( [[ "$(cs_autoscan_on)" == "0" ]] && echo 关 || echo 开 )] · 回收 [$(cs_autoclose_on && echo 开 || echo 关)]"
+        cs_box_menu "9" "备份 / 自检" "备份、恢复、自检"
+        cs_box_sep
+        cs_box_menu "0" "退出"       "数字选择 · 状态每分钟自动检查" "$RED"
+        cs_box_bot
+        printf '  %b提示: 输入数字回车；菜单会随状态自动刷新%b\n' "$DIM" "$R"
+        printf '  %b请选择 [0-9]: %b' "$GRN" "$R"
         read -r c || return 0
         case "$c" in
             1) cs_menu_ufw ;;
