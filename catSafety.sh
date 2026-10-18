@@ -255,6 +255,11 @@ cs_ledger_ports() { # 所有端口(去重)
 
 cs_ledger_rows() { [[ -f "$CS_LEDGER" ]] && cat "$CS_LEDGER"; }
 
+cs_ledger_has_port() { # <port> → 任意 owner 是否登记
+    [[ -f "$CS_LEDGER" ]] || return 1
+    awk -F'\t' -v n="$1" '$3==n { found=1; exit } END { exit(found?0:1) }' "$CS_LEDGER" 2>/dev/null
+}
+
 cs_ledger_owner_of() { # <port> → owner(s)
     [[ -f "$CS_LEDGER" ]] || return 0
     awk -F'\t' -v n="$1" '$3==n {print $1}' "$CS_LEDGER" | sort -u | paste -sd, -
@@ -1750,7 +1755,8 @@ cs_drift_check() {
         ports=$(cs_kernel_ports "$owner")
         for p in $ports; do
             cs_is_protected "$p" && continue
-            if ! cs_ledger_has "$owner" both "$p" && ! cs_ledger_has "$owner" tcp "$p" && ! cs_ledger_has "$owner" udp "$p"; then
+            if ! cs_ledger_has "$owner" both "$p" && ! cs_ledger_has "$owner" tcp "$p" \
+               && ! cs_ledger_has "$owner" udp "$p" && ! cs_ledger_has_port "$p"; then
                 echo "DRIFT: $owner 端口 $p 在监听/配置里，但账本没有"
                 drift=1
             fi
@@ -2173,7 +2179,8 @@ cs_cli() {
                 [[ $_rc -ne 3 ]] && break
                 sleep 1
             done
-            [[ ${_rc:-0} -eq 3 ]] && warn "对账忙（guard 正在执行），稍后再试" ;;
+            if [[ ${_rc:-0} -eq 3 ]]; then warn "对账忙（guard 正在执行），稍后再试"; fi
+            return 0 ;;
         reconcile) cs_owners_sync ;;
         switch) shift; cs_switch "${1:?backend: ufw|nft|iptables|firewalld}" ;;
         json|status-json) cs_status_json ;;
