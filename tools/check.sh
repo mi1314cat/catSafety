@@ -56,7 +56,7 @@ cs_ledger_has xray both 12345 && bad "账本 del 失败" || ok "账本 del"
 [[ "$(cs_kernel_ports sing-box)" == "45678" ]] && ok "Sing-box 端口扫描" || bad "Sing-box 扫描: $(cs_kernel_ports sing-box)"
 
 echo "== 菜单/CLI 入口"
-for fn in main_menu cs_menu_ufw cs_menu_nft cs_menu_f2b cs_menu_ssh cs_menu_ports cs_takeover cs_guard cs_enable cs_disable cs_panic; do
+for fn in main_menu cs_menu_ufw cs_menu_nft cs_menu_f2b cs_menu_ssh cs_menu_ports cs_takeover cs_guard cs_enable cs_disable cs_panic cs_autosync cs_autoscan_on cs_listen_has cs_f2b_check; do
     declare -F "$fn" >/dev/null && ok "存在 $fn" || bad "缺少 $fn"
 done
 

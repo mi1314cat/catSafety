@@ -710,6 +710,9 @@ cs_guard() {
     be=$(cs_backend_get)
     enabled=$(cs_enabled_get)
     [[ "$enabled" == "1" ]] || return 0
+    mkdir -p "$CS_ROOT" 2>/dev/null
+    date +%s >"$CS_ROOT/guard.last" 2>/dev/null
+    cs_autosync >/dev/null 2>&1 || true
 
     # 0) 后端状态丢失（被删/被停）→ 按账本重建
     if ! cs_backend_active; then
@@ -913,6 +916,123 @@ cs_kernel_sync() { # [--prune] [--dry-run]
         if (( dry )); then echo "    + share both/$sp"; else cs_open share both "$sp" "share-service" >/dev/null 2>&1 || true; fi
     fi
     (( dry )) || ok "内核端口同步完成（已处理 $n 个，新增 $added 个）"
+}
+
+# ---------------------------- 自动开放监听端口 / 账本对账 ----------------------------
+# 用户需求: "找本机对外端口自动开放"，同时不能影响三内核自己开关端口。
+# 做法: 以**监听状态**为准每分钟对账：
+#   · 新监听的非回环端口 → 自动放行（owner=auto）
+#   · 账本里有、但既不监听、也不在对应内核当前配置里的端口 → 宽限期后关闭
+#   这样内核无论是用 ufw/iptables/nft 自己开的，还是根本没写防火墙代码（Xray），
+#   只要它把端口 listen 起来，catSafety 就会补放行；它关掉监听，宽限期后回收。
+CS_AUTOSCAN_FILE="${CS_AUTOSCAN_FILE:-$CS_ROOT/autoscan}"
+CS_AUTO_GRACE="${CS_AUTO_GRACE:-900}"          # 宽限秒数，默认 15 分钟
+CS_STALE_FILE="${CS_STALE_FILE:-$CS_ROOT/stale.tsv}"
+CS_LAST_SCAN_FILE="${CS_LAST_SCAN_FILE:-$CS_ROOT/last-scan}"
+
+cs_autoscan_on()  { [[ "$(cat "$CS_AUTOSCAN_FILE" 2>/dev/null || echo 1)" != "0" ]]; }
+cs_autoscan_set() { mkdir -p "$CS_ROOT"; printf '%s\n' "$1" >"$CS_AUTOSCAN_FILE"; }
+
+cs_tcp_listen_ports() {
+    ss -Hltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -nu
+}
+cs_udp_listen_ports() {
+    ss -Huln 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -nu
+}
+cs_listen_has() { # <tcp|udp> <port>
+    local list
+    if [[ "$1" == "tcp" ]]; then list=$(cs_tcp_listen_ports); else list=$(cs_udp_listen_ports); fi
+    printf '%s\n' "$list" | grep -qx "$2"
+}
+
+cs_stale_get() { # <owner> <proto> <port> → 秒数(相对 now) 或空
+    [[ -f "$CS_STALE_FILE" ]] || return 0
+    awk -F'\t' -v o="$1" -v p="$2" -v n="$3" '$1==o&&$2==p&&$3==n{print $4}' "$CS_STALE_FILE" 2>/dev/null
+}
+cs_stale_set() { # <owner> <proto> <port>
+    mkdir -p "$CS_ROOT"
+    cs_stale_del "$1" "$2" "$3"
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date +%s)" >>"$CS_STALE_FILE"
+}
+cs_stale_del() {
+    [[ -f "$CS_STALE_FILE" ]] || return 0
+    awk -F'\t' -v o="$1" -v p="$2" -v n="$3" '!($1==o&&$2==p&&$3==n)' "$CS_STALE_FILE" >"$CS_STALE_FILE.tmp.$$" 2>/dev/null \
+        && mv -f "$CS_STALE_FILE.tmp.$$" "$CS_STALE_FILE" 2>/dev/null || rm -f "$CS_STALE_FILE.tmp.$$"
+}
+
+# 内核配置里的端口（用于判断"服务暂时没起，但配置还在"）
+cs_owner_in_config() { # <owner> <port>
+    local owner="$1" port="$2"
+    case "$owner" in
+        xray)     cs_scan_xray | grep -qx "$port" ;;
+        mihomo)   cs_scan_mihomo | grep -qx "$port" ;;
+        sing-box) cs_scan_singbox | grep -qx "$port" ;;
+        share)    [[ -r /run/proxy-share-service/port ]] && tr -dc '0-9' </run/proxy-share-service/port | grep -qx "$port" ;;
+        *) return 1 ;;
+    esac
+}
+
+cs_autosync() {
+    local now; now=$(date +%s)
+    mkdir -p "$CS_ROOT"
+    # 防并发：guard timer 与手动/开机恢复可能同时跑，对账会互相覆盖
+    local _lock="$CS_ROOT/.autosync.lock"
+    mkdir "$_lock" 2>/dev/null || return 0
+    trap "rmdir '${_lock}' 2>/dev/null" RETURN
+    date +%s >"$CS_LAST_SCAN_FILE" 2>/dev/null
+    [[ "$(cs_enabled_get)" == "1" ]] || return 0
+    cs_autoscan_on || return 0
+
+    local tcp udp opened=0 closed=0 kept=0 proto port owner tag ts
+    tcp=$(cs_tcp_listen_ports)
+    udp=$(cs_udp_listen_ports)
+
+    # --- 1) 新监听端口 → 自动放行 ---
+    for proto in tcp udp; do
+        local list; [[ "$proto" == "tcp" ]] && list=$tcp || list=$udp
+        for port in $list; do
+            [[ "$port" =~ ^[0-9]+$ ]] || continue
+            cs_is_protected "$port" && continue
+            if ! cs_ledger_has auto "$proto" "$port" \
+               && ! cs_ledger_has xray both "$port" && ! cs_ledger_has mihomo both "$port" \
+               && ! cs_ledger_has sing-box both "$port" && ! cs_ledger_has share both "$port" \
+               && ! cs_ledger_has legacy both "$port"; then
+                if cs_open auto "$proto" "$port" "autoscan" >/dev/null 2>&1; then
+                    opened=$((opened+1)); cs_log "auto-open $proto/$port"
+                fi
+            fi
+        done
+    done
+
+    # --- 2) 账本对账：不监听且配置里也没有 → 宽限期后关闭 ---
+    if [[ -f "$CS_LEDGER" ]]; then
+        while IFS=$'\t' read -r owner proto port tag ts; do
+            [[ "$port" =~ ^[0-9]+$ ]] || continue
+            cs_is_protected "$port" && continue
+            [[ "$owner" == "ssh" || "$owner" == "web" ]] && continue
+            local alive=0
+            case "$proto" in
+                tcp)  cs_listen_has tcp "$port" && alive=1 ;;
+                udp)  cs_listen_has udp "$port" && alive=1 ;;
+                both|"") { cs_listen_has tcp "$port" || cs_listen_has udp "$port"; } && alive=1 ;;
+            esac
+            if (( ! alive )) && cs_owner_in_config "$owner" "$port"; then alive=1; fi
+            if (( alive )); then
+                cs_stale_del "$owner" "$proto" "$port"; kept=$((kept+1)); continue
+            fi
+            local since; since=$(cs_stale_get "$owner" "$proto" "$port")
+            [[ -n "$since" ]] || { cs_stale_set "$owner" "$proto" "$port"; continue; }
+            if (( now - since >= CS_AUTO_GRACE )); then
+                if cs_close "$owner" "$proto" "$port" >/dev/null 2>&1; then
+                    closed=$((closed+1)); cs_log "auto-close $owner $proto/$port (stale)"
+                    cs_stale_del "$owner" "$proto" "$port"
+                fi
+            fi
+        done <"$CS_LEDGER"
+    fi
+
+    (( opened || closed )) && ok "自动端口对账: 新增 $opened, 回收 $closed, 保留 $kept"
+    return 0
 }
 
 # ---------------------------- 第三方接管 ----------------------------
@@ -1159,6 +1279,10 @@ cs_f2b_install() {
         admin_ip="${SSH_CONNECTION%% *}"
     fi
     mkdir -p /etc/fail2ban/jail.d
+    local bak=""
+    if [[ -f "$jail" ]]; then
+        bak="$jail.bak.$(date +%Y%m%d-%H%M%S)"; cp -f "$jail" "$bak" 2>/dev/null || true
+    fi
     {
         echo "[DEFAULT]"
         echo "banaction = ${ban}"
@@ -1173,6 +1297,13 @@ cs_f2b_install() {
         echo "backend = systemd"
     } >"$jail"
     ok "已写入 $jail（banaction=$ban, 白名单=${admin_ip:-无}）"
+    # 先做配置语法检查，过了再重启；失败自动恢复旧文件
+    if ! fail2ban-client -t >/dev/null 2>&1; then
+        err "fail2ban 配置检查失败"
+        fail2ban-client -t 2>&1 | tail -8
+        if [[ -n "$bak" ]]; then cp -f "$bak" "$jail" 2>/dev/null; warn "已恢复旧配置: $bak"; fi
+        return 1
+    fi
     systemctl enable fail2ban >/dev/null 2>&1 || true
     systemctl restart fail2ban >/dev/null 2>&1 || { err "fail2ban 启动失败"; systemctl status fail2ban --no-pager 2>&1 | tail -5; return 1; }
     sleep 1
@@ -1187,12 +1318,31 @@ cs_f2b_status() {
     else
         printf '  %bFail2ban%b: %b未运行%b\n' "$B" "$R" "$RED" "$R"
     fi
-    fail2ban-client status 2>/dev/null | sed 's/^/  /' || true
+    printf '  banaction: %s\n' "$(grep -hE '^banaction' /etc/fail2ban/jail.d/*.local /etc/fail2ban/jail.local 2>/dev/null | tail -1 | sed 's/.*= *//')"
+    printf '  白名单  : %s\n' "$(grep -hE '^ignoreip' /etc/fail2ban/jail.d/*.local /etc/fail2ban/jail.local 2>/dev/null | tail -1 | sed 's/.*= *//')"
     local j
     for j in $(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do
-        fail2ban-client status "$j" 2>/dev/null | sed 's/^/  /' || true
+        printf '  %b%s%b: %s\n' "$B" "$j" "$R" \
+            "$(fail2ban-client status "$j" 2>/dev/null | sed -n 's/.*Currently banned:[[:space:]]*//p') 个封禁"
+        fail2ban-client status "$j" 2>/dev/null | grep -E 'Banned IP list' | sed 's/^/    /'
     done
     hr
+}
+
+# 检查"当前登录 IP 是否被自己的 fail2ban 封了"—— 这是 SSH 失联的常见原因之一
+cs_f2b_check() {
+    have fail2ban-client || { info "fail2ban 未安装"; return 0; }
+    local ip="" j bad=0
+    [[ -n "${SSH_CLIENT:-}" ]] && ip="${SSH_CLIENT%% *}"
+    [[ -z "$ip" && -n "${SSH_CONNECTION:-}" ]] && ip="${SSH_CONNECTION%% *}"
+    for j in $(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do
+        if fail2ban-client status "$j" 2>/dev/null | grep -E 'Banned IP list:' | grep -qF "$ip"; then
+            warn "当前 IP $ip 被 jail $j 封禁 → 自动解封"
+            fail2ban-client set "$j" unbanip "$ip" >/dev/null 2>&1 && bad=1
+        fi
+    done
+    (( bad )) && ok "已解封当前 IP" || ok "当前 IP 未被封"
+    return 0
 }
 
 cs_f2b_unban() { # <ip|all>
@@ -1265,6 +1415,30 @@ cs_drift_check() {
 }
 
 # ---------------------------- 状态 / 自检 ----------------------------
+cs_age_str() { # <ts> → "12s 前"
+    local ts="${1:-0}" now age
+    now=$(date +%s)
+    [[ "$ts" =~ ^[0-9]+$ ]] || { printf '未知'; return; }
+    age=$((now - ts))
+    (( age < 0 )) && age=0
+    if (( age < 60 )); then printf '%ss 前' "$age"
+    elif (( age < 3600 )); then printf '%smin 前' "$((age/60))"
+    elif (( age < 86400 )); then printf '%sh 前' "$((age/3600))"
+    else printf '%sd 前' "$((age/86400))"; fi
+}
+
+cs_guard_age() { cs_age_str "$(cat "$CS_ROOT/guard.last" 2>/dev/null || echo 0)"; }
+cs_scan_age()  { cs_age_str "$(cat "$CS_LAST_SCAN_FILE" 2>/dev/null || echo 0)"; }
+
+cs_f2b_summary() {
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        local j; j=$(fail2ban-client status 2>/dev/null | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ')
+        printf '运行中%s' "${j:+ · $j}"
+    else
+        printf '未运行'
+    fi
+}
+
 cs_unit_state() { # <unit> → active/inactive/未安装（单行）
     if systemctl list-unit-files 2>/dev/null | grep -q "^${1}"; then
         local st; st=$(systemctl is-active "$1" 2>/dev/null)
@@ -1314,18 +1488,33 @@ cs_menu_header() {
     clear 2>/dev/null || true
     printf '%b\n' "$CYN"
     cat <<'EOF'
-   /\_/\   catSafety
-  ( o.o )  防火墙 / 安全工具
-   > ^ <
+      /\_/\
+     ( o.o )   catSafety
+      > ^ <    防火墙 / 安全工具
 EOF
     printf '%b' "$R"
-    local be; be=$(cs_backend_get)
-    printf '  后端: %b%s%b   启用: %b%s%b   SSH: %s   守护: %s\n' \
-        "$B" "$be" "$R" \
-        "$([[ "$(cs_enabled_get)" == "1" ]] && echo "$GRN已启用" || echo "$YEL未启用")" "$R" \
-        "$(cs_ssh_ports | paste -sd, -)" \
-        "$(systemctl is-active catSafety-guard.timer 2>/dev/null || echo 未安装)"
+    local be guard_state ssh_ports f2b auto_state
+    be=$(cs_backend_get)
+    ssh_ports=$(cs_ssh_ports | paste -sd, -)
+    if systemctl is-active --quiet catSafety-guard.timer 2>/dev/null; then
+        guard_state="${GRN}● 守护中${R}（${DIM}$(cs_guard_age)检查${R}）"
+    else
+        guard_state="${YEL}○ 未运行${R}"
+    fi
+    if [[ "$(cs_enabled_get)" == "1" ]]; then
+        fw_state="${GRN}已启用${R}"
+    else
+        fw_state="${YEL}未启用${R}"
+    fi
+    auto_state=$([[ "$(cs_autoscan_on)" == "0" ]] && echo "${YEL}关${R}" || echo "${GRN}开${R}")
+    printf '  ┌────────────────────────────────────────────────────────┐\n'
+    printf '  │ 🛡  SSH 守护   %b  端口 %b%s%b\n' "$guard_state" "$B" "$ssh_ports" "$R"
+    printf '  │ 🔥  防火墙     %b %b· 账本 %s 条%b\n' "$B$be$R" "$fw_state" "$([[ -f "$CS_LEDGER" ]] && wc -l <"$CS_LEDGER" || echo 0)" "$R"
+    printf '  │ 👀  自动开放   %b  %b· 最近扫描 %s%b\n' "$auto_state" "$DIM" "$(cs_scan_age)" "$R"
+    printf '  │ 🚫  Fail2ban   %b%s%b\n' "$B" "$(cs_f2b_summary)" "$R"
+    printf '  └────────────────────────────────────────────────────────┘\n'
 }
+
 
 cs_menu_ufw() {
     while true; do
@@ -1375,14 +1564,15 @@ cs_menu_f2b() {
     while true; do
         cs_menu_header
         cs_f2b_status
-        printf '  1) 安装 / 重配 Fail2ban\n  2) 解封全部\n  3) 解封单个 IP\n  4) 加白名单\n  5) 重启\n  0) 返回\n'
-        printf '  请选择 [0-5]: '; read -r c || return 0
+        printf '  1) 安装 / 重配 Fail2ban\n  2) 解封全部\n  3) 解封单个 IP\n  4) 加白名单\n  5) 重启\n  6) 检查当前 IP 是否被封\n  0) 返回\n'
+        printf '  请选择 [0-6]: '; read -r c || return 0
         case "$c" in
             1) cs_f2b_install; pause_ ;;
             2) cs_f2b_unban all; pause_ ;;
             3) printf '  IP: '; read -r ip; cs_f2b_unban "$ip"; pause_ ;;
             4) printf '  IP: '; read -r ip; cs_f2b_whitelist "$ip"; pause_ ;;
             5) systemctl restart fail2ban >/dev/null 2>&1 && ok "已重启" || err "重启失败"; pause_ ;;
+            6) cs_f2b_check; pause_ ;;
             0) return 0 ;;
             *) err "无效选项"; pause_ ;;
         esac
@@ -1410,8 +1600,8 @@ cs_menu_ports() {
     while true; do
         cs_menu_header
         cs_ports_list
-        printf '  1) 放行端口\n  2) 关闭端口\n  3) 三内核同步\n  4) 漂移检查\n  0) 返回\n'
-        printf '  请选择 [0-4]: '; read -r c || return 0
+        printf '  1) 放行端口\n  2) 关闭端口\n  3) 三内核同步\n  4) 漂移检查\n  5) 自动对账（按监听开关）\n  0) 返回\n'
+        printf '  请选择 [0-5]: '; read -r c || return 0
         case "$c" in
             1)
                 printf '  owner (xray/mihomo/sing-box/share/自定义): '; read -r o
@@ -1427,6 +1617,7 @@ cs_menu_ports() {
                 pause_ ;;
             3) cs_kernel_sync; pause_ ;;
             4) cs_drift_check; pause_ ;;
+            5) cs_autosync; pause_ ;;
             0) return 0 ;;
             *) err "无效选项"; pause_ ;;
         esac
@@ -1471,19 +1662,18 @@ cs_restore() { # <dir>
 main_menu() {
     while true; do
         cs_menu_header
-        hr
-        printf '  %b防火墙 / 安全工具%b\n' "$B" "$R"
-        printf '  1) UFW          安装 / 启用 / 停用 / 状态\n'
-        printf '  2) nftables     安装 / 启用 / 停用 / 规则\n'
-        printf '  3) Fail2ban     安装 / 状态 / 解封 / 白名单\n'
-        printf '  4) 一键接管     导入现有规则 + 三内核端口 + 停第三方\n'
-        printf '  5) SSH 保护     状态 / 自动抢救 / 守护 / PANIC\n'
-        printf '  6) 端口管理     列表 / 放行 / 关闭 / 漂移检查\n'
-        printf '  7) 三内核同步   Xray / Mihomo / Sing-box 端口\n'
-        printf '  8) 备份 / 恢复\n'
-        printf '  9) 自检\n'
-        printf '  0) 返回\n'
-        hr
+        printf '  ┌──────────────────── 功能 ─────────────────────┐\n'
+        printf '  │ %b1%b) UFW        安装 / 启用 / 停用 / 状态   │\n' "$B" "$R"
+        printf '  │ %b2%b) nftables   安装 / 启用 / 停用 / 规则   │\n' "$B" "$R"
+        printf '  │ %b3%b) Fail2ban   安装 / 状态 / 解封 / 白名单 │\n' "$B" "$R"
+        printf '  │ %b4%b) 一键接管   导入规则 + 三内核 + 停第三方│\n' "$B" "$R"
+        printf '  │ %b5%b) SSH 保护   状态 / 自动抢救 / PANIC    │\n' "$B" "$R"
+        printf '  │ %b6%b) 端口管理   列表 / 放行 / 关闭 / 对账  │\n' "$B" "$R"
+        printf '  │ %b7%b) 三内核同步 立即扫描并放行当前端口      │\n' "$B" "$R"
+        printf '  │ %b8%b) 自动开放   监听端口自动开关 [%b%s%b]     │\n' "$B" "$R" "$([[ "$(cs_autoscan_on)" == "0" ]] && echo "$RED关$R" || echo "$GRN开$R")" "$R"
+        printf '  │ %b9%b) 备份/恢复 / 自检                       │\n' "$B" "$R"
+        printf '  │ %b0%b) 返回                                   │\n' "$B" "$R"
+        printf '  └───────────────────────────────────────────────┘\n'
         printf '  请选择 [0-9]: '
         read -r c || return 0
         case "$c" in
@@ -1494,8 +1684,14 @@ main_menu() {
             5) cs_menu_ssh ;;
             6) cs_menu_ports ;;
             7) cs_kernel_sync; pause_ ;;
-            8) cs_menu_backup ;;
-            9) cs_selfcheck; pause_ ;;
+            8)
+                if [[ "$(cs_autoscan_on)" == "0" ]]; then
+                    cs_autoscan_set 1; ok "自动开放已开启"
+                else
+                    cs_autoscan_set 0; warn "自动开放已关闭（账本保留，不再自动开关端口）"
+                fi
+                pause_ ;;
+            9) cs_menu_backup ;;
             0) return 0 ;;
             *) err "无效选项"; sleep 1 ;;
         esac
@@ -1520,7 +1716,10 @@ catSafety v${CS_VERSION} — 防火墙 / 安全工具
   catSafety close <owner> <port[/proto]>
   catSafety list                          账本列表
   catSafety check                         漂移检查
-  catSafety f2b {install|status|unban <ip|all>|whitelist <ip>}
+  catSafety autosync                      立即按监听状态对账（开/关端口）
+  catSafety autoscan [on|off|status]      自动开放开关
+  catSafety enabled                       是否已启用（退出码）
+  catSafety f2b {install|status|check|unban <ip|all>|whitelist <ip>}
   catSafety backup | restore <dir>
   catSafety install-guard | install-restore
   catSafety selfcheck
@@ -1535,6 +1734,15 @@ cs_cli() {
         takeover) shift; cs_takeover "$@" ;;
         sync) shift; cs_kernel_sync "$@" ;;
         import-listening) cs_import_listening ;;
+        autosync) cs_autosync ;;
+        autoscan)
+            shift
+            case "${1:-status}" in
+                on)  cs_autoscan_set 1; ok "自动开放已开启" ;;
+                off) cs_autoscan_set 0; warn "自动开放已关闭" ;;
+                status|"") [[ "$(cs_autoscan_on)" == "0" ]] && echo 关 || echo 开 ;;
+                *) echo "用法: catSafety autoscan [on|off|status]" ;;
+            esac ;;
         prune-legacy) cs_ledger_prune_legacy ;;
         guard) cs_guard ;;
         apply) cs_apply ;;
@@ -1552,6 +1760,7 @@ cs_cli() {
                 status|"") echo "$(cs_backend_get)" ;;
                 *) err "未知后端"; return 1 ;;
             esac ;;
+        enabled) [[ "$(cs_enabled_get)" == "1" ]] ;;
         enable) cs_enable ;;
         disable) cs_disable ;;
         panic) cs_panic ;;
@@ -1574,6 +1783,7 @@ cs_cli() {
                 status) cs_f2b_status ;;
                 unban) shift; cs_f2b_unban "${1:-all}" ;;
                 whitelist) shift; cs_f2b_whitelist "${1:?ip}" ;;
+                check) cs_f2b_check ;;
                 *) cs_f2b_status ;;
             esac ;;
         backup) cs_backup ;;

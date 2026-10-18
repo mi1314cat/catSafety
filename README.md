@@ -27,6 +27,15 @@
    - 只关账本里 owner 匹配的端口；SSH / 80 / 443 / 8443 永不自动关；
    - 备份/恢复/漂移检查/自检。
 
+## 内核兼容
+
+- **Mihomo**：`src/lib/fw.sh` 的 `fw_open_port/fw_close_port` 在检测到 catSafety 已启用时，
+  改为调用 `catSafety open/close mihomo`，不再自己写 iptables；
+- **Sing-box**：`conf/lib.sh` 的 `open_port/close_node_port`（以及 `install.sh` 的分享端口）
+  同样优先调用 catSafety；自己的 `.fw-ports` 仍保留用于面板展示；
+- **Xray**：本身没有放行代码，由 catSafety 的自动监听对账覆盖；
+- 没有安装 catSafety 时，三者保持原来的行为（零依赖回退）。
+
 ## 快速开始
 
 ```bash
@@ -86,7 +95,10 @@ legacy   both     18090   imported-listening ...
 - 删除 M 端口规则后 60 秒内 guard 自动恢复；
 - **删除 SSH 规则 → 外部立即不可达 → 约 60 秒内自动恢复**；
 - UFW 模式：`ufw status` 200+ 条 ALLOW，外部可达性同上；同样验证 `ufw delete allow SSH` 后自动恢复；
-- `catSafety check` 无漂移；站点 200；三内核服务均正常。
+- `catSafety check` 无漂移；站点 200；三内核服务均正常；
+- 自动开放：起一个临时监听 → `autosync` 自动放行（外部可达）；停监听 → 宽限期后自动回收（外部不可达）；
+- 内核委托：M 的 `fw_open_port`、SB 的 `open_port` 实测写入 catSafety 账本并由它放行/关闭；
+- Fail2ban：`catSafety f2b check` 会检查当前登录 IP 是否被自己的 jail 封禁并自动解封。
 
 ## 安全边界
 
