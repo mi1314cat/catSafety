@@ -933,11 +933,14 @@ CS_LAST_SCAN_FILE="${CS_LAST_SCAN_FILE:-$CS_ROOT/last-scan}"
 cs_autoscan_on()  { [[ "$(cat "$CS_AUTOSCAN_FILE" 2>/dev/null || echo 1)" != "0" ]]; }
 cs_autoscan_set() { mkdir -p "$CS_ROOT"; printf '%s\n' "$1" >"$CS_AUTOSCAN_FILE"; }
 
+# 只取**对外**监听：绑 127.0.0.1 / ::1 的不算（自动开放不应该为回环端口放行）
 cs_tcp_listen_ports() {
-    ss -Hltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -nu
+    ss -Hltn 2>/dev/null | awk '{print $4}' \
+        | grep -vE '^(127\.|\[::1\]|::1)' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -nu
 }
 cs_udp_listen_ports() {
-    ss -Huln 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -nu
+    ss -Huln 2>/dev/null | awk '{print $4}' \
+        | grep -vE '^(127\.|\[::1\]|::1)' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -nu
 }
 cs_listen_has() { # <tcp|udp> <port>
     local list
