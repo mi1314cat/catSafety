@@ -609,10 +609,13 @@ cs_apply() { # 按 enabled 状态重建当前后端（不做启停决策）
 cs_enable() { # 启用防火墙（带 deadman + SSH 校验）
     local be; be=$(cs_backend_get)
     cs_ssh_listening || { err "sshd 没在监听，拒绝启用防火墙（防止把自己关在外面）"; return 1; }
-    local miss; miss=$(cs_ssh_rule_missing)
-    if [[ -n "${miss// /}" ]]; then
-        warn "SSH 端口规则缺失:$miss —— 先补齐"
-        cs_ssh_protect >/dev/null 2>&1
+    # ufw 未启用时 status 看不到规则，不能据此判断"缺失"（会误报）
+    if [[ "$be" != "ufw" ]] || ufw status 2>/dev/null | grep -q '^Status: active'; then
+        local miss; miss=$(cs_ssh_rule_missing)
+        if [[ -n "${miss// /}" ]]; then
+            warn "SSH 端口规则缺失:$miss —— 先补齐"
+            cs_ssh_protect >/dev/null 2>&1
+        fi
     fi
 
     case "$be" in
