@@ -1820,7 +1820,7 @@ cs_menu_header() {
     fi
 
     cs_box_top "catSafety · 防火墙 / 安全工具"
-    cs_box_row "$(printf '%b%s%b  v%s    %b%s%b' "$B" "版本" "$R" "$CS_VERSION" "$DIM" "为 Xray / Mihomo / Sing-box 设计" "$R")"
+    cs_box_row "$(printf '%b%s%b  v%s' "$B" "版本" "$R" "$CS_VERSION")"
     cs_box_sep
     cs_box_kv "SSH 守护" "$guard_txt"
     cs_box_kv "防火墙" "$fw_txt"
