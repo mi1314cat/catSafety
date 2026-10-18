@@ -255,6 +255,14 @@ cs_ledger_ports() { # 所有端口(去重)
 
 cs_ledger_rows() { [[ -f "$CS_LEDGER" ]] && cat "$CS_LEDGER"; }
 
+cs_rule_ok_for() { # <proto> <port>：both 任一存在即可
+    case "$1" in
+        tcp) cs_rule_exists tcp "$2" ;;
+        udp) cs_rule_exists udp "$2" ;;
+        *)   cs_rule_exists tcp "$2" || cs_rule_exists udp "$2" ;;
+    esac
+}
+
 cs_ledger_has_port() { # <port> → 任意 owner 是否登记
     [[ -f "$CS_LEDGER" ]] || return 1
     awk -F'\t' -v n="$1" '$3==n { found=1; exit } END { exit(found?0:1) }' "$CS_LEDGER" 2>/dev/null
@@ -884,7 +892,7 @@ cs_guard() {
             [[ "$port" =~ ^[0-9]+$ ]] || continue
             [[ "$owner" == "ssh" || "$owner" == "web" ]] && continue
             cs_is_protected "$port" && continue
-            if ! cs_rule_exists tcp "$port"; then miss_any=1; break; fi
+            if ! cs_rule_ok_for "$proto" "$port"; then miss_any=1; break; fi
         done <"$CS_LEDGER"
     fi
     if (( miss_any )); then
@@ -1723,7 +1731,7 @@ cs_ports_list() {
         while IFS=$'\t' read -r owner proto port tag ts; do
             [[ -n "$port" ]] || continue
             st=""
-            cs_rule_exists tcp "$port" && st+="${GRN}规则✓${R} " || st+="${RED}规则✗${R} "
+            cs_rule_ok_for "$proto" "$port" && st+="${GRN}规则✓${R} " || st+="${RED}规则✗${R} "
             cs_listen_has tcp "$port" || cs_listen_has udp "$port" && st+="${GRN}监听✓${R}" || st+="${DIM}监听✗${R}"
             line="$(cs_pad "$owner" 10) $(cs_pad "$proto" 6) $(cs_pad "$port" 6) "
             cs_box_row "${line}${st}  ${DIM}${tag}${R}"
@@ -1746,7 +1754,7 @@ cs_drift_check() {
     if [[ -s "$CS_LEDGER" ]]; then
         while IFS=$'\t' read -r owner proto port tag ts; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
-            cs_rule_exists tcp "$port" || { echo "DRIFT: $owner $proto/$port 账本有、规则无"; drift=1; }
+            cs_rule_ok_for "$proto" "$port" || { echo "DRIFT: $owner $proto/$port 账本有、规则无"; drift=1; }
         done <"$CS_LEDGER"
     fi
     # 监听但没账本（只报内核端口）
