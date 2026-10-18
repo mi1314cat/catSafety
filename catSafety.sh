@@ -34,6 +34,14 @@ CS_INSTALL_DIR="${CS_INSTALL_DIR:-/opt/catSafety}"
 CS_UNIT_DIR="${CS_UNIT_DIR:-/etc/systemd/system}"
 CS_NFT_TABLE="${CS_NFT_TABLE:-catSafety}"
 
+# 可选配置覆盖（root 600）: AUTO_GRACE=900 / AUTOSCAN=0/1
+CS_CONFIG_FILE="${CS_CONFIG_FILE:-$CS_ROOT/config}"
+if [[ -r "$CS_CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$CS_CONFIG_FILE" 2>/dev/null || true
+fi
+CS_AUTO_GRACE="${CS_AUTO_GRACE:-900}"
+
 # 永不自动关闭的端口（SSH 端口会被动态加进来）
 CS_NEVER_TOUCH="80 443 8443"
 
@@ -287,6 +295,7 @@ cs_close() { # <owner> <proto> <port>
         return 1
     fi
     cs_backend_close "$owner" "$proto" "$port" || return 1
+    cs_purge_kernel_rules "$port"
     cs_ledger_del "$owner" "$proto" "$port"
     cs_ledger_del "$owner" both "$port"
     cs_log "close $owner $proto/$port"
@@ -712,6 +721,7 @@ cs_guard() {
     [[ "$enabled" == "1" ]] || return 0
     mkdir -p "$CS_ROOT" 2>/dev/null
     date +%s >"$CS_ROOT/guard.last" 2>/dev/null
+    cs_owners_sync >/dev/null 2>&1 || true
     cs_autosync >/dev/null 2>&1 || true
 
     # 0) 后端状态丢失（被删/被停）→ 按账本重建
@@ -926,9 +936,11 @@ cs_kernel_sync() { # [--prune] [--dry-run]
 #   这样内核无论是用 ufw/iptables/nft 自己开的，还是根本没写防火墙代码（Xray），
 #   只要它把端口 listen 起来，catSafety 就会补放行；它关掉监听，宽限期后回收。
 CS_AUTOSCAN_FILE="${CS_AUTOSCAN_FILE:-$CS_ROOT/autoscan}"
-CS_AUTO_GRACE="${CS_AUTO_GRACE:-900}"          # 宽限秒数，默认 15 分钟
+# 宽限秒数来自上面的配置（默认 900）
 CS_STALE_FILE="${CS_STALE_FILE:-$CS_ROOT/stale.tsv}"
 CS_LAST_SCAN_FILE="${CS_LAST_SCAN_FILE:-$CS_ROOT/last-scan}"
+CS_OWNERS_DIR="${CS_OWNERS_DIR:-$CS_ROOT/owners}"
+CS_HOOKS_DIR="${CS_HOOKS_DIR:-$CS_ROOT/hooks}"
 
 cs_autoscan_on()  { [[ "$(cat "$CS_AUTOSCAN_FILE" 2>/dev/null || echo 1)" != "0" ]]; }
 cs_autoscan_set() { mkdir -p "$CS_ROOT"; printf '%s\n' "$1" >"$CS_AUTOSCAN_FILE"; }
@@ -980,7 +992,7 @@ cs_autosync() {
     mkdir -p "$CS_ROOT"
     # 防并发：guard timer 与手动/开机恢复可能同时跑，对账会互相覆盖
     local _lock="$CS_ROOT/.autosync.lock"
-    mkdir "$_lock" 2>/dev/null || return 0
+    mkdir "$_lock" 2>/dev/null || return 3
     trap "rmdir '${_lock}' 2>/dev/null" RETURN
     date +%s >"$CS_LAST_SCAN_FILE" 2>/dev/null
     [[ "$(cs_enabled_get)" == "1" ]] || return 0
@@ -1020,6 +1032,7 @@ cs_autosync() {
                 both|"") { cs_listen_has tcp "$port" || cs_listen_has udp "$port"; } && alive=1 ;;
             esac
             if (( ! alive )) && cs_owner_in_config "$owner" "$port"; then alive=1; fi
+            if (( ! alive )) && cs_owner_manifest_has "$owner" "$port"; then alive=1; fi
             if (( alive )); then
                 cs_stale_del "$owner" "$proto" "$port"; kept=$((kept+1)); continue
             fi
@@ -1027,6 +1040,7 @@ cs_autosync() {
             [[ -n "$since" ]] || { cs_stale_set "$owner" "$proto" "$port"; continue; }
             if (( now - since >= CS_AUTO_GRACE )); then
                 if cs_close "$owner" "$proto" "$port" >/dev/null 2>&1; then
+                    cs_purge_kernel_rules "$port"
                     closed=$((closed+1)); cs_log "auto-close $owner $proto/$port (stale)"
                     cs_stale_del "$owner" "$proto" "$port"
                 fi
@@ -1034,8 +1048,208 @@ cs_autosync() {
         done <"$CS_LEDGER"
     fi
 
+    cs_sweep_stale_kernel_rules
     (( opened || closed )) && ok "自动端口对账: 新增 $opened, 回收 $closed, 保留 $kept"
     return 0
+}
+
+# 全量清扫：iptables 里带内核注释、但端口已不监听、也不在内核配置里的规则。
+# 不依赖账本 —— 代理项目不走 catSafety 时，账本里可能没有这条记录。
+cs_sweep_stale_kernel_rules() {
+    local bin line proto port c owner
+    for bin in iptables ip6tables; do
+        have "$bin" || continue
+        while IFS= read -r line; do
+            proto=$(printf '%s' "$line" | grep -oE -- '-p (tcp|udp)' | awk '{print $2}')
+            port=$(printf '%s' "$line" | grep -oE -- '--dport [0-9]+' | awk '{print $2}')
+            c=$(printf '%s' "$line" | sed -n 's/.*--comment \([^ ]*\).*/\1/p')
+            [[ -n "$proto" && -n "$port" ]] || continue
+            cs_is_protected "$port" && continue
+            cs_listen_has "$proto" "$port" && continue
+            case "$c" in
+                MIHOMO-Panel*) owner="mihomo" ;;
+                SB-Panel*)     owner="sing-box" ;;
+                Xray-Panel*)   owner="xray" ;;
+                *)             continue ;;
+            esac
+            cs_owner_in_config "$owner" "$port" && continue
+            cs_purge_kernel_rules "$port"
+            cs_log "sweep stale kernel rule: $owner $proto/$port"
+        done < <("$bin" -S INPUT 2>/dev/null | grep -- '--dport' \
+                 | grep -E -- '--comment (MIHOMO-Panel|SB-Panel|Xray-Panel)')
+    done
+}
+
+# ---------------------------- 外部项目联动（声明式 owner 清单） ----------------------------
+# 其他项目**不需要关心**当前是 UFW 还是 nftables，只需要：
+#   1) 写一份清单: /etc/catSafety/owners/<项目名>.ports
+#         tcp 8080
+#         udp 51820
+#         both 443
+#   2) 或者直接调: catSafety owner-set <项目名> tcp:8080 udp:51820
+# catSafety 每分钟按清单放行/回收，切换后端时账本自动迁移。
+# 这样"以后的项目"只有一个稳定接口，不依赖防火墙实现。
+
+cs_owner_name_ok() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,40}$ ]]; }
+cs_owner_file() { printf '%s/%s.ports' "$CS_OWNERS_DIR" "${1:?}"; }
+
+cs_owner_manifest_has() { # <owner> <port>
+    local f; f=$(cs_owner_file "$1" 2>/dev/null) || return 1
+    [[ -f "$f" ]] || return 1
+    awk -v n="$2" '
+        /^[[:space:]]*#/ { next }
+        {
+            p=""
+            if ($1=="tcp"||$1=="udp"||$1=="both") p=$2
+            else if ($1 ~ /^[0-9]+\/(tcp|udp|both)$/) { split($1,a,"/"); p=a[1] }
+            else if ($1 ~ /^[0-9]+$/) p=$1
+            if (p==n) { found=1; exit }
+        }
+        END { exit(found?0:1) }' "$f"
+}
+
+# 清理"内核项目留下、但端口已经不监听"的 iptables 规则。
+# 为什么需要: 代理项目没有改动（用户要求），它们删节点时可能不回收 iptables；
+# 在 UFW 后端下，这些残留 ACCEPT 会绕过 ufw 的 deny，端口看起来还开着。
+# 只删带明确内核注释的规则，且只对"已判定失效"的端口调用。
+cs_purge_kernel_rules() { # <port>
+    local port="$1" bin line
+    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+    for bin in iptables ip6tables; do
+        have "$bin" || continue
+        while :; do
+            line=$("$bin" -S INPUT 2>/dev/null \
+                | grep -- "--dport ${port} " \
+                | grep -E -- '--comment (MIHOMO-Panel|SB-Panel|Xray-Panel|catSafety-)' \
+                | head -1)
+            [[ -n "$line" ]] || break
+            line="${line/-A INPUT /-D INPUT }"
+            "$bin" $line 2>/dev/null || break
+            cs_log "purge stale kernel iptables rule: $port"
+        done
+    done
+}
+
+cs_owners_sync() {
+    [[ -d "$CS_OWNERS_DIR" ]] || return 0
+    local f owner proto port tag ts desired opened closed n
+    for f in "$CS_OWNERS_DIR"/*.ports; do
+        [[ -f "$f" ]] || continue
+        owner=$(basename "$f" .ports)
+        cs_owner_name_ok "$owner" || { warn "跳过非法 owner 名: $owner"; continue; }
+        opened=0; closed=0; n=0
+        # 放行清单里新增的
+        while read -r proto port _tag; do
+            [[ -n "$proto" && -n "$port" ]] || continue
+            [[ "$proto" == "tcp" || "$proto" == "udp" || "$proto" == "both" ]] || continue
+            [[ "$port" =~ ^[0-9]+$ ]] || continue
+            cs_is_protected "$port" && continue
+            n=$((n+1))
+            if ! cs_ledger_has "$owner" "$proto" "$port"; then
+                cs_open "$owner" "$proto" "$port" "manifest" >/dev/null 2>&1 && opened=$((opened+1))
+            fi
+        done < <(awk '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*$/ { next }
+            $1=="tcp"||$1=="udp"||$1=="both" { print $1, $2; next }
+            $1 ~ /^[0-9]+\/(tcp|udp|both)$/ { split($1,a,"/"); print a[2], a[1]; next }
+            $1 ~ /^[0-9]+$/ { print "both", $1; next }' "$f")
+        # 回收清单里删掉的（只动 owner 自己、tag=manifest 的）
+        if [[ -f "$CS_LEDGER" ]]; then
+            while IFS=$'\t' read -r o proto port tag ts; do
+                [[ "$o" == "$owner" && "$tag" == "manifest" ]] || continue
+                cs_owner_manifest_has "$owner" "$port" && continue
+                cs_close "$owner" "$proto" "$port" >/dev/null 2>&1 && closed=$((closed+1))
+            done <"$CS_LEDGER"
+        fi
+        (( opened || closed )) && ok "owner [$owner]: 放行 $opened，回收 $closed（清单 $n 条）"
+    done
+    return 0
+}
+
+cs_owner_set() { # <owner> <tcp:8080|udp:51820|8080> ...
+    local owner="${1:?owner}"; shift
+    cs_owner_name_ok "$owner" || { err "owner 名只能是字母数字._-"; return 1; }
+    mkdir -p "$CS_OWNERS_DIR"
+    local f; f=$(cs_owner_file "$owner")
+    : >"$f.tmp.$$"
+    local spec proto port
+    for spec in "$@"; do
+        case "$spec" in
+            *:*) proto="${spec%%:*}"; port="${spec#*:}" ;;
+            */*) port="${spec%%/*}"; proto="${spec##*/}" ;;
+            *)   proto="both"; port="$spec" ;;
+        esac
+        [[ "$proto" == "tcp" || "$proto" == "udp" || "$proto" == "both" ]] || { err "协议不对: $spec"; rm -f "$f.tmp.$$"; return 1; }
+        [[ "$port" =~ ^[0-9]+$ ]] || { err "端口不对: $spec"; rm -f "$f.tmp.$$"; return 1; }
+        printf '%s %s\n' "$proto" "$port" >>"$f.tmp.$$"
+    done
+    mv -f "$f.tmp.$$" "$f"
+    ok "已更新清单 $f"
+    cs_owners_sync
+}
+
+cs_owner_clear() { # <owner>
+    local owner="${1:?owner}" f; f=$(cs_owner_file "$owner")
+    rm -f "$f"
+    if [[ -f "$CS_LEDGER" ]]; then
+        local o proto port tag ts
+        while IFS=$'\t' read -r o proto port tag ts; do
+            [[ "$o" == "$owner" ]] || continue
+            cs_close "$owner" "$proto" "$port" >/dev/null 2>&1 || true
+        done <"$CS_LEDGER"
+    fi
+    ok "已清除 owner [$owner] 的清单和端口"
+}
+
+# ---------------------------- 后端切换（保留账本） ----------------------------
+cs_run_hook() { # <name> <args...>
+    local h="$CS_HOOKS_DIR/$1"; shift
+    [[ -x "$h" ]] || return 0
+    "$h" "$@" >/dev/null 2>&1 || warn "hook $(basename "$h") 返回非 0"
+}
+
+cs_switch() { # <ufw|nft|iptables>
+    local new="${1:-}" old; old=$(cs_backend_get)
+    case "$new" in ufw|nft|iptables|firewalld) ;; *) err "未知后端: $new"; return 1 ;; esac
+    [[ "$new" == "$old" ]] && { info "后端已经是 $new"; return 0; }
+    cs_run_hook pre-switch "$old" "$new"
+    local was_enabled; was_enabled=$(cs_enabled_get)
+    # 先停旧的（账本不动）
+    cs_disable >/dev/null 2>&1 || true
+    cs_backend_set "$new" || return 1
+    if [[ "$was_enabled" == "1" ]]; then
+        cs_enabled_set 1
+        if ! cs_enable; then
+            err "切换到 $new 失败，回退到 $old"
+            cs_backend_set "$old"
+            cs_enabled_set 1
+            cs_enable >/dev/null 2>&1 || cs_panic >/dev/null 2>&1
+            return 1
+        fi
+    else
+        info "后端已切换为 $new（当前未启用）"
+    fi
+    cs_run_hook post-switch "$old" "$new"
+    # 让系统里可能存在的开机单元也跟着迁移
+    cs_install_restore_unit >/dev/null 2>&1 || true
+    ok "后端切换: $old → $new（账本保留，端口已按新后端重放）"
+}
+
+# ---------------------------- 给其它项目的稳定接口（JSON） ----------------------------
+cs_status_json() {
+    local be en ssh ledger owners guard f2b auto
+    be=$(cs_backend_get); en=$(cs_enabled_get)
+    ssh=$(cs_ssh_ports | paste -sd, -)
+    ledger=$([[ -f "$CS_LEDGER" ]] && wc -l <"$CS_LEDGER" || echo 0)
+    owners=0; [[ -d "$CS_OWNERS_DIR" ]] && owners=$(ls -1 "$CS_OWNERS_DIR"/*.ports 2>/dev/null | wc -l)
+    guard=$(systemctl is-active catSafety-guard.timer 2>/dev/null || echo inactive)
+    f2b=$(systemctl is-active fail2ban 2>/dev/null || echo inactive)
+    auto=$([[ "$(cs_autoscan_on)" == "0" ]] && echo 0 || echo 1)
+    printf '{"version":"%s","backend":"%s","enabled":%s,"ssh_ports":[%s],"ledger":%s,"owners":%s,"guard":"%s","fail2ban":"%s","autoscan":%s}\n' \
+        "$CS_VERSION" "$be" "$([[ "$en" == 1 ]] && echo true || echo false)" \
+        "$(printf '%s' "$ssh" | sed 's/[^0-9,]/ /g; s/ *, */,/g')" \
+        "$ledger" "$owners" "$guard" "$f2b" "$auto"
 }
 
 # ---------------------------- 第三方接管 ----------------------------
@@ -1721,6 +1935,11 @@ catSafety v${CS_VERSION} — 防火墙 / 安全工具
   catSafety check                         漂移检查
   catSafety autosync                      立即按监听状态对账（开/关端口）
   catSafety autoscan [on|off|status]      自动开放开关
+  catSafety owner-set <owner> <tcp:8080|udp:51820|8080>...   声明式端口清单
+  catSafety owner-clear <owner>           删除清单并回收端口
+  catSafety reconcile                     立即按清单对账
+  catSafety switch <ufw|nft|iptables>     切换后端（账本保留）
+  catSafety json                          状态 JSON（给其它项目/面板）
   catSafety enabled                       是否已启用（退出码）
   catSafety f2b {install|status|check|unban <ip|all>|whitelist <ip>}
   catSafety backup | restore <dir>
@@ -1737,7 +1956,37 @@ cs_cli() {
         takeover) shift; cs_takeover "$@" ;;
         sync) shift; cs_kernel_sync "$@" ;;
         import-listening) cs_import_listening ;;
-        autosync) cs_autosync ;;
+        autosync)
+            local _i _rc
+            for _i in 1 2 3 4 5 6 7 8 9 10; do
+                cs_autosync; _rc=$?
+                [[ $_rc -ne 3 ]] && break
+                sleep 1
+            done
+            [[ ${_rc:-0} -eq 3 ]] && warn "对账忙（guard 正在执行），稍后再试" ;;
+        reconcile) cs_owners_sync ;;
+        switch) shift; cs_switch "${1:?backend: ufw|nft|iptables|firewalld}" ;;
+        json|status-json) cs_status_json ;;
+        owner-set) shift; cs_owner_set "$@" ;;
+        owner-clear) shift; cs_owner_clear "${1:?owner}" ;;
+        owners) ls -1 "$CS_OWNERS_DIR"/*.ports 2>/dev/null | xargs -r -n1 basename | sed 's/\.ports$//' ;;
+
+        port)
+            shift
+            case "${1:-list}" in
+                open)
+                    shift
+                    local _o="${1:?owner}" _sp="${2:?port}" _pp
+                    _pp=$(cs_norm_port "$_sp") || die "端口格式不对"
+                    cs_open "$_o" "${_pp#* }" "${_pp%% *}" "api" || die "放行失败" ;;
+                close)
+                    shift
+                    local _o="${1:?owner}" _sp="${2:?port}" _pp
+                    _pp=$(cs_norm_port "$_sp") || die "端口格式不对"
+                    cs_close "$_o" "${_pp#* }" "${_pp%% *}" || die "关闭失败" ;;
+                list)  cs_ports_list ;;
+                *)     cs_usage ;;
+            esac ;;
         autoscan)
             shift
             case "${1:-status}" in

@@ -42,6 +42,10 @@ export CS_X_LEDGER="$TMP/none1" CS_M_LEDGER="$TMP/none2" CS_SB_LEDGER="$TMP/none
 # shellcheck disable=SC1090
 source "$ROOT/catSafety.sh"
 
+# catSafety 里也有 ok/bad（打印用），会覆盖测试计数器 —— 这里恢复
+ok(){ PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$*"; }
+bad(){ FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$*"; }
+
 r=$(cs_norm_port "8080/udp"); [[ "$r" == "8080 udp" ]] && ok "端口解析 8080/udp" || bad "端口解析: $r"
 r=$(cs_norm_port "70000"); [[ -z "$r" ]] && ok "非法端口被拒" || bad "非法端口未拒: $r"
 
@@ -55,8 +59,18 @@ cs_ledger_has xray both 12345 && bad "账本 del 失败" || ok "账本 del"
 [[ "$(cs_kernel_ports mihomo)" == "34567" ]] && ok "Mihomo 端口扫描" || bad "Mihomo 扫描: $(cs_kernel_ports mihomo)"
 [[ "$(cs_kernel_ports sing-box)" == "45678" ]] && ok "Sing-box 端口扫描" || bad "Sing-box 扫描: $(cs_kernel_ports sing-box)"
 
+echo "== 联动接口"
+mkdir -p "$CS_OWNERS_DIR"
+printf 'tcp 12345\nudp 51820\n' >"$CS_OWNERS_DIR/demo.ports"
+cs_owner_manifest_has demo 12345 && ok "owner 清单解析 tcp" || bad "owner 清单解析 tcp"
+cs_owner_manifest_has demo 51820 && ok "owner 清单解析 udp" || bad "owner 清单解析 udp"
+cs_owner_manifest_has demo 65000 && bad "owner 清单误报" || ok "owner 清单不误报"
+echo '{"a":1}' >/dev/null
+json_out=$(cs_status_json 2>/dev/null)
+printf '%s' "$json_out" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null && ok "status JSON 合法" || bad "status JSON 不合法: $json_out"
+
 echo "== 菜单/CLI 入口"
-for fn in main_menu cs_menu_ufw cs_menu_nft cs_menu_f2b cs_menu_ssh cs_menu_ports cs_takeover cs_guard cs_enable cs_disable cs_panic cs_autosync cs_autoscan_on cs_listen_has cs_f2b_check; do
+for fn in main_menu cs_menu_ufw cs_menu_nft cs_menu_f2b cs_menu_ssh cs_menu_ports cs_takeover cs_guard cs_enable cs_disable cs_panic cs_autosync cs_autoscan_on cs_listen_has cs_f2b_check cs_owners_sync cs_owner_set cs_owner_clear cs_switch cs_status_json cs_purge_kernel_rules cs_sweep_stale_kernel_rules; do
     declare -F "$fn" >/dev/null && ok "存在 $fn" || bad "缺少 $fn"
 done
 

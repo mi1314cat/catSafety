@@ -73,6 +73,7 @@ install_all(){
 
     mkdir -p "$INSTALL_DIR" /etc/catSafety || die "创建目录失败"
     install -m 0755 "$src/catSafety.sh" "$INSTALL_DIR/catSafety.sh" || die "复制主程序失败"
+    [[ -f "$src/api.sh" ]] && install -m 0644 "$src/api.sh" "$INSTALL_DIR/api.sh" || true
     [[ -d "$src/docs" ]] && cp -rf "$src/docs" "$INSTALL_DIR/" 2>/dev/null || true
     [[ -f "$src/README.md" ]] && cp -f "$src/README.md" "$INSTALL_DIR/" 2>/dev/null || true
     ln -sfn "$INSTALL_DIR/catSafety.sh" "$BIN"

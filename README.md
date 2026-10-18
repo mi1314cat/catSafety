@@ -27,7 +27,18 @@
    - 只关账本里 owner 匹配的端口；SSH / 80 / 443 / 8443 永不自动关；
    - 备份/恢复/漂移检查/自检。
 
-## 内核兼容
+## 内核项目零改动
+
+不修改 Xray / Mihomo / Sing-box 的任何代码也能兼容：
+
+- **监听对账**：内核把端口 listen 起来后，catSafety 自动补放行；监听关掉、宽限后回收；
+- **残留规则清扫**：UFW 后端下，内核留下的 `MIHOMO-Panel` / `SB-Panel` iptables 规则
+  如果对应端口已不监听、也不在内核配置里，会被自动删除（只删带明确注释的规则）；
+- 代价是回收不是"删除节点那一刻"，而是"监听消失 + 宽限期"（默认 15 分钟，可调）。
+
+如果愿意改一行代码，也可以走 `source /opt/catSafety/api.sh` 的即时接口。
+
+## 内核兼容（旧说明，已不要求改内核）
 
 - **Mihomo**：`src/lib/fw.sh` 的 `fw_open_port/fw_close_port` 在检测到 catSafety 已启用时，
   改为调用 `catSafety open/close mihomo`，不再自己写 iptables；
@@ -35,6 +46,49 @@
   同样优先调用 catSafety；自己的 `.fw-ports` 仍保留用于面板展示；
 - **Xray**：本身没有放行代码，由 catSafety 的自动监听对账覆盖；
 - 没有安装 catSafety 时，三者保持原来的行为（零依赖回退）。
+
+## 给其它项目的联动（不依赖 UFW / nftables）
+
+其他项目只需要认 catSafety 一个接口，**不用关心当前后端是什么**：
+
+### 方式 A：声明式清单（推荐，零代码改动）
+
+```bash
+catSafety owner-set myapp tcp:8080 udp:51820
+# 或直接写文件 /etc/catSafety/owners/myapp.ports:
+#   tcp 8080
+#   udp 51820
+#   both 443
+```
+
+- catSafety 每分钟按清单放行；清单删掉端口 → 自动回收；
+- 切换后端（UFW ↔ nftables）时账本保留，自动重放。
+
+### 方式 B：source API
+
+```bash
+source /opt/catSafety/api.sh
+catsafety_open  myapp 8080/tcp
+catsafety_close myapp 8080/tcp
+catsafety_set_ports myapp tcp:8080 udp:51820
+catsafety_status_json
+```
+
+### 方式 C：直接 CLI
+
+```bash
+catSafety port open  <owner> <port[/proto]>
+catSafety port close <owner> <port[/proto]>
+catSafety json
+catSafety switch nft     # 或 ufw；账本/端口自动迁移
+```
+
+### 后端切换与 hooks
+
+- `catSafety switch ufw|nft|iptables`：停旧后端 → 设新后端 → 按账本重放；失败自动回退；
+- 切换前后会执行（存在且可执行）：
+  - `/etc/catSafety/hooks/pre-switch <old> <new>`
+  - `/etc/catSafety/hooks/post-switch <old> <new>`
 
 ## 快速开始
 
