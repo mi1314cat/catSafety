@@ -148,7 +148,15 @@ cs_box_bot() {
     printf '%b╰%s╯%b\n' "$CYN" "$d" "$R"
 }
 cs_box_row() { # <可见内容>
-    local s=" $(cs_trunc "${1:-}" $((CS_W-1)))" n
+    # ★ 不能无条件 cs_trunc：cs_trunc 会剥掉 ANSI，状态颜色就全白了。
+    #   短行（绝大多数）保留原始转义；只有真的超宽才降级为无颜色截断。
+    local raw="${1:-}" s n w
+    w=$(cs_w " $raw")
+    if (( w <= CS_W - 1 )); then
+        s=" $raw"
+    else
+        s=" $(cs_trunc "$raw" $((CS_W-1)))"
+    fi
     n=$(( CS_W - $(cs_w "$s") )); (( n < 0 )) && n=0
     printf '%b│%b%s%*s%b│%b\n' "$CYN" "$R" "$s" "$n" '' "$CYN" "$R"
 }
