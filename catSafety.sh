@@ -41,6 +41,8 @@ if [[ -r "$CS_CONFIG_FILE" ]]; then
     . "$CS_CONFIG_FILE" 2>/dev/null || true
 fi
 CS_AUTO_GRACE="${CS_AUTO_GRACE:-900}"
+CS_AUTO_CLOSE="${CS_AUTO_CLOSE:-1}"
+CS_AUTOCLOSE_FILE="${CS_AUTOCLOSE_FILE:-$CS_ROOT/autoclose}"
 
 # 永不自动关闭的端口（SSH 端口会被动态加进来）
 CS_NEVER_TOUCH="80 443 8443"
@@ -944,6 +946,8 @@ CS_HOOKS_DIR="${CS_HOOKS_DIR:-$CS_ROOT/hooks}"
 
 cs_autoscan_on()  { [[ "$(cat "$CS_AUTOSCAN_FILE" 2>/dev/null || echo 1)" != "0" ]]; }
 cs_autoscan_set() { mkdir -p "$CS_ROOT"; printf '%s\n' "$1" >"$CS_AUTOSCAN_FILE"; }
+cs_autoclose_on() { [[ "${CS_AUTO_CLOSE:-1}" != "0" ]] && [[ "$(cat "$CS_AUTOCLOSE_FILE" 2>/dev/null || echo 1)" != "0" ]]; }
+cs_autoclose_set(){ mkdir -p "$CS_ROOT"; printf '%s\n' "$1" >"$CS_AUTOCLOSE_FILE"; }
 
 # 只取**对外**监听：绑 127.0.0.1 / ::1 的不算（自动开放不应该为回环端口放行）
 cs_tcp_listen_ports() {
@@ -1020,7 +1024,7 @@ cs_autosync() {
     done
 
     # --- 2) 账本对账：不监听且配置里也没有 → 宽限期后关闭 ---
-    if [[ -f "$CS_LEDGER" ]]; then
+    if cs_autoclose_on && [[ -f "$CS_LEDGER" ]]; then
         while IFS=$'\t' read -r owner proto port tag ts; do
             [[ "$port" =~ ^[0-9]+$ ]] || continue
             cs_is_protected "$port" && continue
@@ -1048,7 +1052,7 @@ cs_autosync() {
         done <"$CS_LEDGER"
     fi
 
-    cs_sweep_stale_kernel_rules
+    cs_autoclose_on && cs_sweep_stale_kernel_rules
     (( opened || closed )) && ok "自动端口对账: 新增 $opened, 回收 $closed, 保留 $kept"
     return 0
 }
@@ -1841,6 +1845,30 @@ cs_menu_ports() {
     done
 }
 
+cs_menu_auto() {
+    while true; do
+        cs_menu_header
+        hr
+        printf '  %b自动开放%b  扫描: %s   回收: %s   宽限: %s 秒\n' "$B" "$R" \
+            "$([[ "$(cs_autoscan_on)" == "0" ]] && echo 关 || echo 开)" \
+            "$(cs_autoclose_on && echo 开 || echo 关)" "$CS_AUTO_GRACE"
+        printf '    最近扫描: %s\n' "$(cs_scan_age)"
+        hr
+        printf '  1) 开/关 自动扫描（是否自动放行新监听端口）\n'
+        printf '  2) 开/关 自动回收（监听消失后是否自动关闭）\n'
+        printf '  3) 立即对账\n'
+        printf '  0) 返回\n'
+        printf '  请选择 [0-3]: '; read -r c || return 0
+        case "$c" in
+            1) [[ "$(cs_autoscan_on)" == "0" ]] && { cs_autoscan_set 1; ok "自动扫描已开"; } || { cs_autoscan_set 0; warn "自动扫描已关"; }; pause_ ;;
+            2) cs_autoclose_on && { cs_autoclose_set 0; warn "自动回收已关（只开不关）"; } || { cs_autoclose_set 1; ok "自动回收已开"; }; pause_ ;;
+            3) catSafety autosync 2>/dev/null || cs_autosync; pause_ ;;
+            0) return 0 ;;
+            *) err "无效选项"; pause_ ;;
+        esac
+    done
+}
+
 cs_menu_backup() {
     while true; do
         cs_menu_header
@@ -1901,13 +1929,7 @@ main_menu() {
             5) cs_menu_ssh ;;
             6) cs_menu_ports ;;
             7) cs_kernel_sync; pause_ ;;
-            8)
-                if [[ "$(cs_autoscan_on)" == "0" ]]; then
-                    cs_autoscan_set 1; ok "自动开放已开启"
-                else
-                    cs_autoscan_set 0; warn "自动开放已关闭（账本保留，不再自动开关端口）"
-                fi
-                pause_ ;;
+            8) cs_menu_auto ;;
             9) cs_menu_backup ;;
             0) return 0 ;;
             *) err "无效选项"; sleep 1 ;;
@@ -1934,7 +1956,8 @@ catSafety v${CS_VERSION} — 防火墙 / 安全工具
   catSafety list                          账本列表
   catSafety check                         漂移检查
   catSafety autosync                      立即按监听状态对账（开/关端口）
-  catSafety autoscan [on|off|status]      自动开放开关
+  catSafety autoscan [on|off|status]      自动扫描（自动放行新监听）
+  catSafety autoclose [on|off|status]     自动回收（监听消失后关闭）
   catSafety owner-set <owner> <tcp:8080|udp:51820|8080>...   声明式端口清单
   catSafety owner-clear <owner>           删除清单并回收端口
   catSafety reconcile                     立即按清单对账
@@ -1994,6 +2017,14 @@ cs_cli() {
                 off) cs_autoscan_set 0; warn "自动开放已关闭" ;;
                 status|"") [[ "$(cs_autoscan_on)" == "0" ]] && echo 关 || echo 开 ;;
                 *) echo "用法: catSafety autoscan [on|off|status]" ;;
+            esac ;;
+        autoclose)
+            shift
+            case "${1:-status}" in
+                on)  cs_autoclose_set 1; ok "自动回收已开启" ;;
+                off) cs_autoclose_set 0; warn "自动回收已关闭（只开不关）" ;;
+                status|"") cs_autoclose_on && echo 开 || echo 关 ;;
+                *) echo "用法: catSafety autoclose [on|off|status]" ;;
             esac ;;
         prune-legacy) cs_ledger_prune_legacy ;;
         guard) cs_guard ;;
