@@ -28,6 +28,28 @@ CS_VERSION="1.0.0"
 CS_ROOT="${CS_ROOT:-/etc/catSafety}"
 CS_LEDGER="${CS_LEDGER:-$CS_ROOT/ledger.tsv}"
 CS_STATE="${CS_STATE:-$CS_ROOT/backend}"
+
+# ufw status 很贵：实测 0.15s / 97% CPU；guard 每个账本端口都调一次，
+# 几十个端口就是 30-45 秒、CPU 打满。同一轮 guard 内规则不会变，缓存 2 秒。
+_CS_UFW_CACHE_FILE="/run/catSafety/ufw.status"
+_cs_ufw_status_cached() {
+    local f="$_CS_UFW_CACHE_FILE" now mt=0
+    now=$(date +%s 2>/dev/null || echo 0)
+    [[ -f "$f" ]] && mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    # 2 秒缓存：同一轮 guard 几十个端口只跑一次 ufw status。
+    # 不能用普通 shell 变量缓存 —— cs_rule_exists 在 $(...) / 管道子 shell 里
+    # 被调用，变量赋值回不到父进程（实测缓存在子 shell 里等于没有）。
+    if [[ ! -s "$f" || $((now - mt)) -ge 2 ]]; then
+        mkdir -p "${f%/*}" 2>/dev/null || true
+        if ufw status 2>/dev/null >"$f.$$"; then
+            mv -f "$f.$$" "$f" 2>/dev/null || rm -f "$f.$$"
+        else
+            rm -f "$f.$$"
+        fi
+    fi
+    cat "$f" 2>/dev/null || true
+}
+_cs_ufw_cache_clear() { rm -f "$_CS_UFW_CACHE_FILE" 2>/dev/null || true; }
 CS_LOG="${CS_LOG:-/var/log/catSafety.log}"
 CS_BACKUP="${CS_BACKUP:-$CS_ROOT/backup}"
 CS_INSTALL_DIR="${CS_INSTALL_DIR:-/opt/catSafety}"
@@ -275,6 +297,20 @@ cs_ledger_owner_of() { # <port> → owner(s)
 
 # ---------------------------- SSH 检测 ----------------------------
 cs_ssh_ports() {
+    # guard 启动时会把结果导出到 CS_SSH_PORTS_CACHE；子 shell 也能直接读。
+    if [[ -n "${CS_SSH_PORTS_CACHE:-}" ]]; then
+        printf '%s\n' "$CS_SSH_PORTS_CACHE"
+        return 0
+    fi
+    # 同一轮 guard 会为每个账本端口调 cs_is_ssh_port → cs_ssh_ports；
+    # 每次都跑 ss + sshd -T + grep 配置文件，几十个端口就是十几秒。
+    # 2 秒文件缓存（同样不能用 shell 变量：调用发生在 $(...) 子 shell 里）。
+    local _f="/run/catSafety/ssh-ports" _now _mt=0
+    _now=$(date +%s 2>/dev/null || echo 0)
+    [[ -f "$_f" ]] && _mt=$(stat -c %Y "$_f" 2>/dev/null || echo 0)
+    if [[ -s "$_f" && $((_now - _mt)) -lt 2 ]]; then
+        cat "$_f"; return 0
+    fi
     local out=""
     # 1) 正在监听的 sshd（最真实）
     if have ss; then
@@ -294,7 +330,12 @@ cs_ssh_ports() {
     # 4) 兜底：只有完全探测不到时才假设 22（否则会误报）
     local got
     got=$(printf '%s\n' "$out" | tr -d '\r' | grep -E '^[0-9]+$' | sort -nu)
-    if [[ -z "$got" ]]; then echo 22; else printf '%s\n' "$got"; fi
+    [[ -z "$got" ]] && got=22
+    mkdir -p "${_f%/*}" 2>/dev/null || true
+    if printf '%s\n' "$got" >"$_f.$$" 2>/dev/null; then
+        mv -f "$_f.$$" "$_f" 2>/dev/null || rm -f "$_f.$$"
+    fi
+    printf '%s\n' "$got"
 }
 
 cs_ssh_listening() { # 返回 0=至少一个 SSH 端口在监听
@@ -312,6 +353,10 @@ cs_ssh_listening() { # 返回 0=至少一个 SSH 端口在监听
 
 cs_is_ssh_port() {
     local p="$1" s
+    if [[ -n "${CS_SSH_PORTS_CACHE:-}" ]]; then
+        for s in $CS_SSH_PORTS_CACHE; do [[ "$s" == "$p" ]] && return 0; done
+        return 1
+    fi
     for s in $(cs_ssh_ports); do [[ "$s" == "$p" ]] && return 0; done
     return 1
 }
@@ -324,6 +369,9 @@ cs_is_protected() { # <port>
 
 # ---------------------------- 后端探测/选择 ----------------------------
 cs_backend_get() {
+    if [[ -n "${CS_BACKEND_CACHE:-}" ]]; then
+        printf '%s' "$CS_BACKEND_CACHE"; return 0
+    fi
     [[ -s "$CS_STATE" ]] && { tr -d '[:space:]' <"$CS_STATE"; return 0; }
     # 自动探测：先看谁在管，再看有什么
     if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then echo ufw; return 0; fi
@@ -344,7 +392,7 @@ cs_backend_set() {
 
 cs_backend_active() {
     case "$(cs_backend_get)" in
-        ufw)        have ufw && ufw status 2>/dev/null | grep -q '^Status: active' ;;
+        ufw)        have ufw && _cs_ufw_status_cached | grep -q '^Status: active' ;;
         nft)        have nft && nft list table inet "$CS_NFT_TABLE" >/dev/null 2>&1 ;;
         firewalld)  have firewall-cmd && firewall-cmd --state 2>/dev/null | grep -q running ;;
         iptables)   have iptables && iptables -S INPUT 2>/dev/null | grep -q -- '--dport' ;;
@@ -369,8 +417,13 @@ cs_foreign_list() {
 # ---------------------------- 后端：规则是否存在 ----------------------------
 cs_rule_exists() { # <proto: tcp|udp> <port>
     local proto="$1" port="$2"
-    case "$(cs_backend_get)" in
-        ufw) ufw status 2>/dev/null | grep -qE "^${port}/${proto} +ALLOW" ;;
+    case "${CS_BACKEND_CACHE:-$(cs_backend_get)}" in
+        ufw)
+            if [[ -n "${CS_UFW_ALLOW_CACHE+x}" ]]; then
+                [[ " $CS_UFW_ALLOW_CACHE " == *" ${port}/${proto} "* ]]
+            else
+                _cs_ufw_status_cached | grep -qE "^${port}/${proto} +ALLOW"
+            fi ;;
         nft)
             # 不用 `nft | grep -q`: grep 提前退出会让 nft 收到 SIGPIPE，
             # 加上 pipefail 时整条管道被判失败 —— 实测同样的规则查询会
@@ -850,13 +903,24 @@ cs_panic() {
 # ---------------------------- guard（SSH 自动抢救） ----------------------------
 cs_guard() {
     local be enabled changed=0 p
+    _cs_ufw_cache_clear
+    rm -f /run/catSafety/ssh-ports 2>/dev/null || true
+    unset CS_SSH_PORTS_CACHE CS_UFW_ALLOW_CACHE CS_UFW_ALLOW_CACHE
     be=$(cs_backend_get)
     enabled=$(cs_enabled_get)
     [[ "$enabled" == "1" ]] || return 0
+    # 一次算好，导出给所有子 shell；下面几十个账本端口只做字符串比较。
+    export CS_BACKEND_CACHE="$be"
+    export CS_SSH_PORTS_CACHE="$(cs_ssh_ports)"
+    if [[ "$be" == "ufw" ]] && have ufw; then
+        export CS_UFW_ALLOW_CACHE="$(ufw status 2>/dev/null | awk '$2=="ALLOW"{print $1}' | tr '\n' ' ')"
+    fi
     mkdir -p "$CS_ROOT" 2>/dev/null
     date +%s >"$CS_ROOT/guard.last" 2>/dev/null
     cs_owners_sync >/dev/null 2>&1 || true
-    cs_autosync >/dev/null 2>&1 || true
+    # guard 每分钟跑，但全量 autoscan 会遍历所有监听端口（1000+ 子进程、
+    # 实测 4s/95% CPU）。SSH 抢救仍然每分钟；autoscan 默认 5 分钟一次。
+    CS_AUTOSYNC_THROTTLE=1 cs_autosync >/dev/null 2>&1 || true
 
     # 0) 后端状态丢失（被删/被停）→ 按账本重建
     if ! cs_backend_active; then
@@ -925,6 +989,7 @@ cs_guard() {
         done < <(cs_ssh_ports)
     fi
 
+    _cs_ufw_cache_clear
     if (( changed )); then
         cs_log "guard: repaired ssh/firewall state"
         printf 'guard repaired at %s\n' "$(date '+%F %T')" >>"$CS_ROOT/guard.log" 2>/dev/null
@@ -1125,6 +1190,15 @@ cs_owner_in_config() { # <owner> <port>
 
 cs_autosync() {
     local now; now=$(date +%s)
+    # 仅 guard 调用时限流；用户手动 `catSafety autosync` 仍然全量。
+    if [[ "${CS_AUTOSYNC_THROTTLE:-0}" == "1" ]]; then
+        local last=0
+        [[ -f "$CS_LAST_SCAN_FILE" ]] && last=$(cat "$CS_LAST_SCAN_FILE" 2>/dev/null || echo 0)
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        if (( last > 0 && now - last < ${CS_AUTOSCAN_INTERVAL:-300} )); then
+            return 0
+        fi
+    fi
     mkdir -p "$CS_ROOT"
     # 防并发：guard timer 与手动/开机恢复可能同时跑，对账会互相覆盖
     local _lock="$CS_ROOT/.autosync.lock"
